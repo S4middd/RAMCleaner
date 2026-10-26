@@ -1,47 +1,45 @@
 # RAM Cleaner
 
-Aplikasi pembersih memori untuk Windows. Ringan, berjalan di system tray, dibangun dengan WinForms + GDI+ tanpa dependensi eksternal (tidak butuh .NET SDK, cukup csc.exe bawaan .NET Framework).
+Pembersih RAM untuk Windows. Jendela utamanya kecil, sisanya hidup di system tray.
+
+Dibuat pakai WinForms + GDI+ saja. Kenapa bukan WPF? Karena runtime WPF (PresentationFramework + compositor) makan 40-60 MB untuk aplikasi yang 99% waktunya cuma tidur di tray. Untuk pembersih RAM, itu ironis. WinForms dengan gambar manual cukup, dan footprint-nya jauh lebih kecil.
+
+Build-nya juga nggak perlu Visual Studio atau SDK. Cukup csc.exe bawaan .NET Framework yang pasti sudah ada di Windows Anda.
 
 ## Fitur
 
-- **Bersihkan RAM** — mengosongkan working set proses dan purge standby list (perintah yang sama dipakai RAMMap).
-- **Monitoring realtime** — tampilan penggunaan RAM diperbarui tiap 2 detik (melambat jadi 5 detik saat jendela disembunyikan di tray).
-- **System tray** — bersihkan RAM langsung dari menu tray tanpa membuka jendela.
-- **Alat lanjutan** (panel tersembunyi):
-  - Restart Explorer
-  - Daftar proses + akhiri proses tertentu
-- Single instance — tidak bisa dijalankan dobel.
-- Footprint kecil: tanpa WPF/runtime berat, 99% waktunya tidur di tray.
+- Bersihkan RAM (working set + standby list, perintah yang sama dipakai RAMMap)
+- Info pemakaian RAM yang di-refresh tiap 2 detik. Kalau jendela disembunyikan ke tray, refresh dilambatkan jadi 5 detik biar hemat
+- Bersihkan RAM langsung dari menu tray, tanpa buka jendela
+- Panel alat lanjutan (tersembunyi sampai dibuka): Restart Explorer dan daftar proses lengkap dengan tombol "akhiri proses"
+- Single instance. Dijalankan dobel? Nggak bisa, cuma muncul pesan "cek ikonnya di system tray"
 
 ## Persyaratan
 
-- Windows 7 / 8 / 8.1 / 10 / 11
-- .NET Framework 4.x (sudah bawaan Windows 10/11)
-- Hak administrator (aplikasi otomatis minta UAC via manifest `requireAdministrator`)
+- Windows 7 sampai 11
+- .NET Framework 4.x (Windows 10/11 sudah punya)
+- Hak admin, aplikasi otomatis minta lewat UAC
 
-## Langkah Build
+## Cara Build
 
-1. Buka folder project.
-2. Jalankan `build.bat` (klik dua kali atau dari command prompt).
-3. Jika sukses, muncul `RAMCleaner.exe` di folder yang sama.
+1. Buka folder project-nya
+2. Jalankan `build.bat`
+3. Kalau sukses, `RAMCleaner.exe` muncul di folder yang sama
 
-Build memakai `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` — tidak perlu Visual Studio atau SDK apa pun.
+Kalau muncul "GAGAL: csc.exe tidak ditemukan", berarti .NET Framework 4.x belum terpasang.
 
-## Langkah Menjalankan
+## Cara Pakai
 
-1. Klik dua kali `RAMCleaner.exe`.
-2. Klik **Yes** pada dialog UAC (aplikasi butuh hak admin untuk membersihkan memori).
-3. Jendela utama terbuka, ikon muncul di system tray.
+1. Klik dua kali `RAMCleaner.exe`, klik **Yes** di dialog UAC
+2. Klik tombol "Bersihkan RAM" untuk membersihkan, atau klik kanan ikon di tray → "Bersihkan RAM sekarang"
+3. Alat lanjutan ada di panel yang dibuka lewat tombol "Tampilkan alat lanjutan ▾" di bawah. Isinya Restart Explorer dan daftar proses (klik kanan proses untuk mengakhirinya)
+4. Tutup jendela, aplikasi tetap jalan di tray. Klik dua kali ikonnya untuk buka lagi
 
-## Langkah Penggunaan
+## Catatan Jujur Soal Cara Kerjanya
 
-1. **Bersihkan RAM** — klik tombol biru "Bersihkan RAM", atau klik kanan ikon tray → "Bersihkan RAM sekarang".
-2. **Alat lanjutan** — klik "Tampilkan alat lanjutan ▾" untuk membuka panel: Restart Explorer, daftar proses, akhiri proses.
-3. **Sembunyikan ke tray** — tutup/minimize jendela; aplikasi tetap berjalan di tray. Klik dua kali ikon tray untuk membuka lagi.
+EmptyWorkingSet dan purge standby list TIDAK menghapus data dari RAM. Keduanya cuma memindahkan halaman keluar dari working set proses ke standby list / pagefile.
 
-## Cara Kerja & Catatan Jujur
-
-`EmptyWorkingSet` dan purge standby list **tidak menghapus data dari RAM**. Keduanya memindahkan halaman keluar dari working set proses ke standby list / pagefile. Angka "Available RAM naik" mengukur berapa banyak halaman yang dipindahkan, bukan keuntungan bersih — aplikasi yang halamannya diambil akan memuat ulang dari disk dan sesaat terasa lebih lambat.
+Angka "Available RAM naik" itu mengukur berapa banyak halaman yang dipindahkan, bukan keuntungan bersih. Aplikasi yang halamannya diambil akan memuat ulang dari disk, dan sesaat terasa lebih lambat. Jadi bersihkan RAM saat benar-benar butuh, bukan tiap lima menit.
 
 ## Struktur Project
 
