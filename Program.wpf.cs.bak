@@ -1,0 +1,2266 @@
+// RAM Cleaner - utilitas pembersih memori untuk Windows.
+//
+// Build: jalankan build.bat (csc.exe .NET Framework, tanpa SDK).
+// Bahasa: C# 5 (csc v4.0.30319) - hindari string interpolation, ?., nameof.
+//
+// Catatan jujur soal cara kerjanya: EmptyWorkingSet dan purge standby list TIDAK
+// menghapus data dari RAM. Keduanya memindahkan halaman keluar dari working set
+// proses ke standby list / pagefile. Angka "Available RAM naik" karena itu mengukur
+// berapa banyak halaman yang dipindahkan, bukan keuntungan bersih: aplikasi yang
+// halamannya diambil akan memuat ulang dari disk dan sesaat terasa lebih lambat.
+
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text;
+using System.Threading;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Documents;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Shapes;
+using System.Windows.Threading;
+
+// System.IO.Path bentrok dengan System.Windows.Shapes.Path (WPF).
+using IOPath = System.IO.Path;
+
+namespace RamCleaner
+{
+    internal static class MemApi
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MEMORYSTATUSEX
+        {
+            public uint dwLength;
+            public uint dwMemoryLoad;
+            public ulong ullTotalPhys;
+            public ulong ullAvailPhys;
+            public ulong ullTotalPageFile;
+            public ulong ullAvailPageFile;
+            public ulong ullTotalVirtual;
+            public ulong ullAvailVirtual;
+            public ulong ullAvailExtendedVirtual;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PERFORMANCE_INFORMATION
+        {
+            public uint cb;
+            public IntPtr CommitTotal;
+            public IntPtr CommitLimit;
+            public IntPtr CommitPeak;
+            public IntPtr PhysicalTotal;
+            public IntPtr PhysicalAvailable;
+            public IntPtr SystemCache;
+            public IntPtr KernelTotal;
+            public IntPtr KernelPaged;
+            public IntPtr KernelNonpaged;
+            public IntPtr PageSize;
+            public uint HandleCount;
+            public uint ProcessCount;
+            public uint ThreadCount;
+        }
+
+        public struct MemBreakdown
+        {
+            public ulong TotalBytes;
+            public ulong InUseBytes;
+            public ulong StandbyBytes;
+            public ulong ModifiedBytes;
+            public ulong FreeBytes;
+            // true bila angka standby/free berasal dari SystemMemoryListInformation
+            // (akurat). false bila hanya perkiraan dari GetPerformanceInfo.
+            public bool Accurate;
+        }
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        public static extern bool GetPerformanceInfo(out PERFORMANCE_INFORMATION pPerformanceInformation, uint cb);
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        public static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GetCurrentProcess();
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+        [DllImport("ntdll.dll")]
+        public static extern int NtSetSystemInformation(int infoClass, ref int info, int length);
+
+        [DllImport("ntdll.dll")]
+        public static extern int NtQuerySystemInformation(
+            int infoClass, IntPtr buffer, int length, out int returnLength);
+
+        public const int SystemMemoryListInformation = 80;
+
+        // MEMORY_LIST_COMMAND - perintah yang masih didukung Windows modern.
+        // Ini set yang sama dipakai RAMMap.
+        public const int CmdEmptyWorkingSets = 2;            // termasuk system working set (file cache)
+        public const int CmdFlushModifiedList = 3;           // tulis halaman kotor ke disk -> jadi standby
+        public const int CmdPurgeStandbyList = 4;
+        public const int CmdPurgeLowPriorityStandbyList = 5;
+
+        private static readonly int SizeMemStatus = Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+        private static readonly int SizePerfInfo = Marshal.SizeOf(typeof(PERFORMANCE_INFORMATION));
+
+        public static bool TryGetStatus(out MEMORYSTATUSEX s)
+        {
+            s = new MEMORYSTATUSEX();
+            s.dwLength = (uint)SizeMemStatus;
+            return GlobalMemoryStatusEx(ref s);
+        }
+
+        // SYSTEM_MEMORY_LIST_INFORMATION dibaca sebagai deretan ULONG_PTR supaya
+        // otomatis benar di 32-bit maupun 64-bit:
+        //   0 ZeroPageCount, 1 FreePageCount, 2 ModifiedPageCount,
+        //   3 ModifiedNoWritePageCount, 4 BadPageCount,
+        //   5..12 PageCountByPriority[8]  <- ini standby list
+        //   13..20 RepurposedPagesByPriority[8], 21 ModifiedPageCountPageFile
+        private const int MemListFieldCount = 22;
+
+        public static bool TryGetMemoryList(
+            out ulong standbyPages, out ulong freePages, out ulong modifiedPages)
+        {
+            standbyPages = 0;
+            freePages = 0;
+            modifiedPages = 0;
+
+            int slot = IntPtr.Size;
+            IntPtr buf = IntPtr.Zero;
+            try
+            {
+                buf = Marshal.AllocHGlobal(slot * MemListFieldCount);
+                int written;
+                int st = NtQuerySystemInformation(
+                    SystemMemoryListInformation, buf, slot * MemListFieldCount, out written);
+                if (st != 0)
+                {
+                    return false;
+                }
+
+                ulong zero = (ulong)Marshal.ReadIntPtr(buf, 0 * slot).ToInt64();
+                ulong free = (ulong)Marshal.ReadIntPtr(buf, 1 * slot).ToInt64();
+                modifiedPages = (ulong)Marshal.ReadIntPtr(buf, 2 * slot).ToInt64();
+
+                ulong standby = 0;
+                for (int i = 0; i < 8; i++)
+                {
+                    standby += (ulong)Marshal.ReadIntPtr(buf, (5 + i) * slot).ToInt64();
+                }
+
+                standbyPages = standby;
+                freePages = zero + free;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                if (buf != IntPtr.Zero) { Marshal.FreeHGlobal(buf); }
+            }
+        }
+
+        public static MemBreakdown GetBreakdown()
+        {
+            MemBreakdown b = new MemBreakdown();
+
+            PERFORMANCE_INFORMATION pi;
+            pi.cb = (uint)SizePerfInfo;
+            if (!GetPerformanceInfo(out pi, pi.cb))
+            {
+                return b;
+            }
+
+            long pageSize = pi.PageSize.ToInt64();
+            if (pageSize <= 0) { pageSize = 4096; }
+
+            ulong total = (ulong)(pi.PhysicalTotal.ToInt64() * pageSize);
+            ulong avail = (ulong)(pi.PhysicalAvailable.ToInt64() * pageSize);
+            b.TotalBytes = total;
+
+            ulong standbyPages, freePages, modifiedPages;
+            if (TryGetMemoryList(out standbyPages, out freePages, out modifiedPages))
+            {
+                b.StandbyBytes = standbyPages * (ulong)pageSize;
+                b.FreeBytes = freePages * (ulong)pageSize;
+                b.ModifiedBytes = modifiedPages * (ulong)pageSize;
+
+                ulong notInUse = b.StandbyBytes + b.FreeBytes;
+                b.InUseBytes = total > notInUse ? total - notInUse : 0;
+                b.Accurate = true;
+                return b;
+            }
+
+            // Fallback perkiraan. Available sudah mencakup standby, dan
+            // pi.SystemCache adalah system cache working set (BUKAN ukuran standby
+            // list), jadi standby tidak bisa dipisahkan di jalur ini.
+            b.InUseBytes = total > avail ? total - avail : 0;
+            b.StandbyBytes = 0;
+            b.FreeBytes = avail;
+            b.Accurate = false;
+            return b;
+        }
+
+        // Mengembalikan null bila sukses, atau deskripsi error bila gagal.
+        public static string RunCommand(int command)
+        {
+            try
+            {
+                int cmd = command;
+                int st = NtSetSystemInformation(SystemMemoryListInformation, ref cmd, 4);
+                if (st == 0)
+                {
+                    return null;
+                }
+                if (st == unchecked((int)0xC0000061))
+                {
+                    return "hak istimewa tidak dimiliki (0xC0000061)";
+                }
+                if (st == unchecked((int)0xC0000002))
+                {
+                    return "tidak didukung Windows ini (0xC0000002)";
+                }
+                return "NTSTATUS 0x" + st.ToString("X8");
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
+            }
+        }
+    }
+
+    internal static class Privilege
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LUID
+        {
+            public uint LowPart;
+            public int HighPart;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct TOKEN_PRIVILEGES
+        {
+            public int PrivilegeCount;
+            public LUID Luid;
+            public int Attributes;
+        }
+
+        private const uint TOKEN_ADJUST_PRIVILEGES = 0x20;
+        private const uint TOKEN_QUERY = 0x8;
+        private const int SE_PRIVILEGE_ENABLED = 0x2;
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool LookupPrivilegeValue(string systemName, string name, out LUID luid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool AdjustTokenPrivileges(
+            IntPtr tokenHandle, bool disableAllPrivileges,
+            ref TOKEN_PRIVILEGES newState, int bufferLength,
+            IntPtr previousState, IntPtr returnLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public static bool Enable(string privilegeName)
+        {
+            IntPtr token = IntPtr.Zero;
+            try
+            {
+                // Pseudo-handle kernel32 (-1): tidak perlu ditutup, dan tidak
+                // membocorkan Process object seperti Process.GetCurrentProcess().Handle.
+                if (!OpenProcessToken(MemApi.GetCurrentProcess(),
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out token))
+                {
+                    return false;
+                }
+
+                LUID luid;
+                if (!LookupPrivilegeValue(null, privilegeName, out luid))
+                {
+                    return false;
+                }
+
+                TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
+                tp.PrivilegeCount = 1;
+                tp.Luid = luid;
+                tp.Attributes = SE_PRIVILEGE_ENABLED;
+
+                bool ok = AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+                // AdjustTokenPrivileges tetap TRUE walau privilege tidak dimiliki;
+                // ERROR_NOT_ALL_ASSIGNED (1300) yang menandakan kegagalan sebenarnya.
+                int err = Marshal.GetLastWin32Error();
+                return ok && err == 0;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                if (token != IntPtr.Zero) { CloseHandle(token); }
+            }
+        }
+    }
+
+    public class ProcItem : INotifyPropertyChanged
+    {
+        private string _name;
+        private int _id;
+        private double _memMb;
+
+        public string Name
+        {
+            get { return _name; }
+            set { if (_name != value) { _name = value; Raise("Name"); } }
+        }
+
+        public int Id
+        {
+            get { return _id; }
+            set { if (_id != value) { _id = value; Raise("Id"); } }
+        }
+
+        public double MemMB
+        {
+            get { return _memMb; }
+            set { if (_memMb != value) { _memMb = value; Raise("MemMB"); } }
+        }
+
+        // Dipakai untuk memastikan PID belum didaur ulang oleh proses lain
+        // sebelum kita membersihkan / mengakhiri proses. 0 = tidak diketahui.
+        public long StartTicks { get; set; }
+
+        public event PropertyChangedEventHandler PropertyChanged;
+
+        private void Raise(string prop)
+        {
+            PropertyChangedEventHandler h = PropertyChanged;
+            if (h != null) { h(this, new PropertyChangedEventArgs(prop)); }
+        }
+    }
+
+    internal static class Log
+    {
+        private static readonly object Gate = new object();
+        private static string _path;
+        private static bool _resolved;
+
+        // Dihitung lazy, BUKAN di static initializer: kalau ini throw di dalam
+        // type initializer, app mati tanpa dialog karena berjalan sebelum
+        // try/catch di Main.
+        public static string FilePath
+        {
+            get
+            {
+                lock (Gate)
+                {
+                    if (!_resolved)
+                    {
+                        _resolved = true;
+                        _path = Resolve();
+                    }
+                    return _path;
+                }
+            }
+        }
+
+        private static string Resolve()
+        {
+            try
+            {
+                string exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                if (!string.IsNullOrEmpty(exe))
+                {
+                    string dir = IOPath.GetDirectoryName(exe);
+                    if (!string.IsNullOrEmpty(dir))
+                    {
+                        return IOPath.Combine(dir, "RAMCleaner_history.log");
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                string local = IOPath.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "RAMCleaner");
+                Directory.CreateDirectory(local);
+                return IOPath.Combine(local, "RAMCleaner_history.log");
+            }
+            catch { }
+
+            return null;
+        }
+
+        public static void Write(string line)
+        {
+            string path = FilePath;
+            if (string.IsNullOrEmpty(path)) { return; }
+            try
+            {
+                string stamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                lock (Gate)
+                {
+                    File.AppendAllText(path, stamp + "  " + line + Environment.NewLine, Encoding.UTF8);
+                }
+            }
+            catch { /* log gagal tidak boleh menjatuhkan app */ }
+        }
+
+        // Mengembalikan null bila sukses, atau pesan error.
+        public static string Open()
+        {
+            string path = FilePath;
+            if (string.IsNullOrEmpty(path))
+            {
+                return "Lokasi file log tidak bisa ditentukan.";
+            }
+            try
+            {
+                if (!File.Exists(path))
+                {
+                    File.WriteAllText(path,
+                        "# Riwayat pembersihan RAM Cleaner" + Environment.NewLine +
+                        "# Belum ada pembersihan yang tercatat." + Environment.NewLine,
+                        Encoding.UTF8);
+                }
+                Process p = Process.Start(new ProcessStartInfo
+                {
+                    FileName = path,
+                    UseShellExecute = true
+                });
+                if (p != null) { p.Dispose(); }
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
+            }
+        }
+    }
+
+    // NotifyIcon dari WinForms. Tipe WinForms selalu ditulis lengkap supaya tidak
+    // bentrok dengan tipe WPF bernama sama (ContextMenu, Application, MessageBox).
+    internal static class Tray
+    {
+        private static System.Windows.Forms.NotifyIcon _ni;
+        private static bool _hintShown;
+
+        public static bool Active { get { return _ni != null; } }
+
+        public static void Init()
+        {
+            try
+            {
+                _ni = new System.Windows.Forms.NotifyIcon();
+                _ni.Icon = LoadIcon();
+                _ni.Text = "RAM Cleaner";
+                _ni.Visible = true;
+
+                System.Windows.Forms.ContextMenuStrip menu = new System.Windows.Forms.ContextMenuStrip();
+                menu.Items.Add("Tampilkan jendela", null, delegate { Program.ShowFromTray(); });
+                menu.Items.Add("Bersihkan RAM sekarang", null, delegate { Program.CleanFromTray(); });
+                menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+                menu.Items.Add("Keluar", null, delegate { Program.ExitApp(); });
+                _ni.ContextMenuStrip = menu;
+
+                _ni.DoubleClick += delegate { Program.ShowFromTray(); };
+            }
+            catch (Exception ex)
+            {
+                Log.Write("Tray gagal diinisialisasi: " + ex.Message);
+                _ni = null;
+            }
+        }
+
+        private static System.Drawing.Icon LoadIcon()
+        {
+            try
+            {
+                string exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                if (!string.IsNullOrEmpty(exe))
+                {
+                    System.Drawing.Icon ic = System.Drawing.Icon.ExtractAssociatedIcon(exe);
+                    if (ic != null) { return ic; }
+                }
+            }
+            catch { }
+            return System.Drawing.SystemIcons.Application;
+        }
+
+        public static void SetTooltip(string text)
+        {
+            if (_ni == null) { return; }
+            try
+            {
+                // NotifyIcon.Text dibatasi 63 karakter.
+                if (text != null && text.Length > 63) { text = text.Substring(0, 63); }
+                _ni.Text = text;
+            }
+            catch { }
+        }
+
+        public static void Balloon(string title, string body)
+        {
+            if (_ni == null) { return; }
+            try
+            {
+                _ni.ShowBalloonTip(4000, title, body, System.Windows.Forms.ToolTipIcon.Info);
+            }
+            catch { }
+        }
+
+        public static void MinimizeHint()
+        {
+            if (_hintShown) { return; }
+            _hintShown = true;
+            Balloon("RAM Cleaner", "Masih berjalan di tray. Klik dua kali ikonnya untuk membuka lagi.");
+        }
+
+        public static void Dispose()
+        {
+            if (_ni == null) { return; }
+            try
+            {
+                _ni.Visible = false;
+                _ni.Dispose();
+            }
+            catch { }
+            _ni = null;
+        }
+    }
+
+    internal static class Program
+    {
+        private static readonly Color ColBg = Color.FromRgb(0x1E, 0x1E, 0x2E);
+        private static readonly Color ColPanel = Color.FromRgb(0x18, 0x18, 0x25);
+        private static readonly Color ColSurface = Color.FromRgb(0x31, 0x32, 0x44);
+        private static readonly Color ColSurfaceHi = Color.FromRgb(0x45, 0x47, 0x5A);
+        private static readonly Color ColText = Color.FromRgb(0xCD, 0xD6, 0xF4);
+        private static readonly Color ColSubtext = Color.FromRgb(0xA6, 0xAD, 0xC8);
+        private static readonly Color ColMuted = Color.FromRgb(0x6C, 0x70, 0x86);
+        private static readonly Color ColBlue = Color.FromRgb(0x89, 0xB4, 0xFA);
+        private static readonly Color ColBlueHi = Color.FromRgb(0xB4, 0xBE, 0xFE);
+        private static readonly Color ColGreen = Color.FromRgb(0xA6, 0xE3, 0xA1);
+        private static readonly Color ColYellow = Color.FromRgb(0xF9, 0xE2, 0xAF);
+        private static readonly Color ColRed = Color.FromRgb(0xF3, 0x8B, 0xA8);
+        private static readonly Color ColTeal = Color.FromRgb(0x94, 0xE2, 0xD5);
+
+        // Brush di-cache: sebelumnya setiap UpdateDisplay (tiap 2 detik) membuat
+        // SolidColorBrush baru.
+        private static readonly Brush BrBg = Solid(ColBg);
+        private static readonly Brush BrPanel = Solid(ColPanel);
+        private static readonly Brush BrSurface = Solid(ColSurface);
+        private static readonly Brush BrSurfaceHi = Solid(ColSurfaceHi);
+        private static readonly Brush BrText = Solid(ColText);
+        private static readonly Brush BrSubtext = Solid(ColSubtext);
+        private static readonly Brush BrMuted = Solid(ColMuted);
+        private static readonly Brush BrBlue = Solid(ColBlue);
+        private static readonly Brush BrBlueHi = Solid(ColBlueHi);
+        private static readonly Brush BrGreen = Solid(ColGreen);
+        private static readonly Brush BrYellow = Solid(ColYellow);
+        private static readonly Brush BrRed = Solid(ColRed);
+        private static readonly Brush BrTeal = Solid(ColTeal);
+
+        private static Window _window;
+        private static Application _app;
+        private static Mutex _singleInstance;
+
+        private static TextBlock _txtUsage;
+        private static Grid _meter;
+        private static Border _barFill;
+        private static TextBlock _txtDetail;
+        private static Button _btnClean;
+        private static Button _btnRestartExplorer;
+        private static Button _btnRefresh;
+        private static CheckBox _chkAggressive;
+        private static TextBlock _txtStatus;
+        private static ListView _lvProcs;
+        private static DispatcherTimer _timer;
+        private static int _lastPct;
+        private static CheckBox _chkAuto;
+        private static TextBox _txtThreshold;
+        private static volatile bool _isCleaning;
+        private static int _lastCleanTicks;
+        private static Grid _stack;
+        private static Border _barInUse;
+        private static Border _barStandby;
+        private static Border _barFree;
+        private static TextBlock _txtBreakdown;
+        private static double _lastInUseFrac;
+        private static double _lastStandbyFrac;
+        private static ContextMenu _procMenu;
+        private static bool _menuOpen;
+        private static int _tickCounter;
+
+        private static Canvas _histCanvas;
+        private static Polyline _histLine;
+        private static Polygon _histFill;
+        private static Line _histGridMid;
+        private static Line _histGridHigh;
+        private static readonly List<int> _history = new List<int>();
+        private const int HistoryMax = 120;   // 120 x 2 detik = 4 menit
+
+        private static readonly ObservableCollection<ProcItem> _procs =
+            new ObservableCollection<ProcItem>();
+
+        private static int _ownPid;
+        private static int _ownSessionId;
+
+        private static readonly string[] Excluded = new string[]
+        {
+            "system", "idle", "registry", "memory compression", "secure system",
+            "memcompression", "smss", "csrss", "wininit", "winlogon",
+            "services", "lsass", "svchost", "dwm", "fontdrvhost",
+            "sihost", "explorer", "conhost", "wudfhost"
+        };
+
+        // Mode mendalam: hanya proses yang benar-benar kritis dilewati.
+        // svchost, dwm, explorer, dll. ikut dibersihkan seperti RAMMap.
+        private static readonly string[] ExcludedCritical = new string[]
+        {
+            "system", "idle", "registry", "memory compression", "secure system",
+            "memcompression", "smss", "csrss", "wininit", "winlogon",
+            "services", "lsass"
+        };
+
+        [STAThread]
+        public static void Main()
+        {
+            try
+            {
+                bool created;
+                _singleInstance = new Mutex(true, "Local\\RAMCleaner_SingleInstance", out created);
+                if (!created)
+                {
+                    MessageBox.Show(
+                        "RAM Cleaner sudah berjalan.\nCek ikonnya di system tray.",
+                        "RAM Cleaner", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+            }
+            catch
+            {
+                // Mutex gagal dibuat bukan alasan untuk membatalkan start.
+                _singleInstance = null;
+            }
+
+            try
+            {
+                System.Windows.Forms.Application.EnableVisualStyles();
+            }
+            catch { }
+
+            try
+            {
+                RunApp();
+            }
+            catch (Exception ex)
+            {
+                Log.Write("FATAL: " + ex);
+                MessageBox.Show(ex.ToString(), "RAM Cleaner - Error",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                Tray.Dispose();
+                ReleaseInstanceLock();
+            }
+        }
+
+        private static void ReleaseInstanceLock()
+        {
+            if (_singleInstance == null) { return; }
+            try { _singleInstance.ReleaseMutex(); } catch { }
+            try { _singleInstance.Dispose(); } catch { }
+            _singleInstance = null;
+        }
+
+        // Saat jendela tersembunyi di tray, monitoring dilambatkan: tidak ada
+        // yang melihat grafik/daftar, dan auto-clean tetap jalan walau 5 detik.
+        private static void SetTimerSlow(bool slow)
+        {
+            if (_timer == null) { return; }
+            _timer.Interval = TimeSpan.FromSeconds(slow ? 5 : 2);
+        }
+
+        private static void TrimOwnWorkingSet()
+        {
+            // GC dulu supaya halaman heap yang bebas ikut terlepas, baru
+            // EmptyWorkingSet mendorong sisanya ke standby list.
+            try
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+            }
+            catch { }
+            try { MemApi.EmptyWorkingSet(MemApi.GetCurrentProcess()); } catch { }
+        }
+
+        private static void RunApp()
+        {
+            CacheOwnIdentity();
+
+            _lastCleanTicks = Environment.TickCount - 600000;
+
+            _app = new Application();
+            _app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            _app.Exit += delegate { Tray.Dispose(); };
+
+            _window = BuildWindow();
+            WireEvents();
+
+            _window.SourceInitialized += delegate
+            {
+                HwndSource src = (HwndSource)PresentationSource.FromVisual(_window);
+                if (src != null)
+                {
+                    int on = 1;
+                    // DWMWA_USE_IMMERSIVE_DARK_MODE: 20 di Windows 10 2004+, 19 sebelumnya.
+                    if (MemApi.DwmSetWindowAttribute(src.Handle, 20, ref on, 4) != 0)
+                    {
+                        MemApi.DwmSetWindowAttribute(src.Handle, 19, ref on, 4);
+                    }
+                }
+            };
+
+            _window.StateChanged += delegate
+            {
+                if (_window.WindowState == WindowState.Minimized && Tray.Active)
+                {
+                    _window.Hide();
+                    SetTimerSlow(true);
+                    TrimOwnWorkingSet();
+                    Tray.MinimizeHint();
+                }
+            };
+
+            // Menutup jendela = keluar aplikasi (ShutdownMode OnExplicitShutdown
+            // berarti kita harus shutdown sendiri).
+            _window.Closed += delegate { ExitApp(); };
+
+            Tray.Init();
+
+            // Manifest sudah requireAdministrator, jadi normalnya cabang ini tidak
+            // terpakai. Tetap disimpan untuk build tanpa manifest.
+            if (!IsAdmin())
+            {
+                _txtStatus.Text = "Berjalan tanpa hak Admin - pembersihan tidak akan menyeluruh.";
+            }
+
+            _window.Show();
+            UpdateDisplay();
+
+            // Setelah render pertama, buang halaman startup yang tidak dipakai.
+            _window.Dispatcher.BeginInvoke(
+                DispatcherPriority.ApplicationIdle,
+                new Action(TrimOwnWorkingSet));
+
+            _timer = new DispatcherTimer();
+            _timer.Interval = TimeSpan.FromSeconds(2);
+            _timer.Tick += delegate { OnTick(); };
+            _timer.Start();
+
+            _app.Run();
+        }
+
+        private static void CacheOwnIdentity()
+        {
+            try
+            {
+                using (Process me = Process.GetCurrentProcess())
+                {
+                    _ownPid = me.Id;
+                    _ownSessionId = me.SessionId;
+                }
+            }
+            catch
+            {
+                _ownPid = 0;
+                _ownSessionId = -1;
+            }
+        }
+
+        private static bool IsAdmin()
+        {
+            try
+            {
+                return new WindowsPrincipal(WindowsIdentity.GetCurrent())
+                    .IsInRole(WindowsBuiltInRole.Administrator);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        internal static void ExitApp()
+        {
+            Tray.Dispose();
+            if (_timer != null) { _timer.Stop(); }
+            ReleaseInstanceLock();
+            try { _app.Shutdown(); } catch { }
+        }
+
+        internal static void ShowFromTray()
+        {
+            if (_window == null) { return; }
+            _window.Dispatcher.BeginInvoke(new Action(delegate
+            {
+                _window.Show();
+                _window.WindowState = WindowState.Normal;
+                SetTimerSlow(false);
+                _window.Activate();
+                _window.Topmost = true;
+                _window.Topmost = false;
+            }));
+        }
+
+        internal static void CleanFromTray()
+        {
+            if (_window == null) { return; }
+            _window.Dispatcher.BeginInvoke(new Action(delegate { CleanRam(false); }));
+        }
+
+        // ===================== UI =====================
+
+        private static Border MakeCard(Thickness margin)
+        {
+            Border b = new Border();
+            b.Background = BrPanel;
+            b.CornerRadius = new CornerRadius(10);
+            b.Padding = new Thickness(16);
+            b.Margin = margin;
+            return b;
+        }
+
+        private static void CardLabel(Panel sp, string text, Brush color)
+        {
+            TextBlock t = new TextBlock();
+            t.Text = text;
+            t.FontSize = 12;
+            t.FontWeight = FontWeights.Bold;
+            t.Foreground = color;
+            sp.Children.Add(t);
+        }
+
+        private static Window BuildWindow()
+        {
+            Window w = new Window();
+            w.Title = "RAM Cleaner";
+            w.Width = 1120;
+            w.Height = 660;
+            w.MinWidth = 900;
+            w.MinHeight = 560;
+            w.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            w.ResizeMode = ResizeMode.CanResize;
+            w.Background = BrBg;
+            w.FontFamily = new FontFamily("Segoe UI");
+
+            Grid root = new Grid();
+            root.Margin = new Thickness(18);
+            AddRow(root, GridLength.Auto);
+            AddRow(root, GridLength.Auto);
+            AddRow(root, new GridLength(1, GridUnitType.Star));
+            w.Content = root;
+
+            TextBlock title = new TextBlock();
+            title.Text = "RAM CLEANER";
+            title.FontSize = 14;
+            title.FontWeight = FontWeights.Bold;
+            title.Foreground = BrBlue;
+            Grid.SetRow(title, 0);
+            root.Children.Add(title);
+
+            TextBlock subtitle = new TextBlock();
+            subtitle.Text = "Pembersih memori - mode cepat & mendalam";
+            subtitle.FontSize = 11;
+            subtitle.Foreground = BrSubtext;
+            subtitle.Margin = new Thickness(0, 2, 0, 12);
+            Grid.SetRow(subtitle, 1);
+            root.Children.Add(subtitle);
+
+            Grid content = new Grid();
+            AddColumn(content, new GridLength(0.95, GridUnitType.Star));
+            AddColumn(content, new GridLength(1.05, GridUnitType.Star));
+            AddColumn(content, new GridLength(1.55, GridUnitType.Star));
+            Grid.SetRow(content, 2);
+            root.Children.Add(content);
+
+            content.Children.Add(BuildUsageCard());
+            content.Children.Add(BuildControlCard());
+            content.Children.Add(BuildProcessCard());
+
+            return w;
+        }
+
+        private static void AddRow(Grid g, GridLength h)
+        {
+            RowDefinition r = new RowDefinition();
+            r.Height = h;
+            g.RowDefinitions.Add(r);
+        }
+
+        private static void AddColumn(Grid g, GridLength wd)
+        {
+            ColumnDefinition c = new ColumnDefinition();
+            c.Width = wd;
+            g.ColumnDefinitions.Add(c);
+        }
+
+        private static UIElement BuildUsageCard()
+        {
+            Border card = MakeCard(new Thickness(0, 0, 10, 0));
+            StackPanel usp = new StackPanel();
+            card.Child = usp;
+            Grid.SetColumn(card, 0);
+
+            CardLabel(usp, "PENGGUNAAN RAM", BrBlue);
+
+            _txtUsage = new TextBlock();
+            _txtUsage.Text = "-";
+            _txtUsage.FontSize = 58;
+            _txtUsage.FontWeight = FontWeights.Bold;
+            _txtUsage.Foreground = BrGreen;
+            _txtUsage.HorizontalAlignment = HorizontalAlignment.Center;
+            _txtUsage.Margin = new Thickness(0, 6, 0, 0);
+            usp.Children.Add(_txtUsage);
+
+            Grid meter = new Grid();
+            meter.Height = 14;
+            meter.Margin = new Thickness(0, 10, 0, 0);
+
+            Border track = new Border();
+            track.CornerRadius = new CornerRadius(7);
+            track.Background = BrSurface;
+            meter.Children.Add(track);
+
+            _barFill = new Border();
+            _barFill.CornerRadius = new CornerRadius(7);
+            _barFill.HorizontalAlignment = HorizontalAlignment.Left;
+            _barFill.Margin = new Thickness(1);
+            _barFill.Background = BrGreen;
+            meter.Children.Add(_barFill);
+
+            _meter = meter;
+            meter.SizeChanged += delegate { RefreshFillWidth(); };
+            usp.Children.Add(meter);
+
+            _txtDetail = new TextBlock();
+            _txtDetail.FontSize = 12;
+            _txtDetail.Foreground = BrSubtext;
+            _txtDetail.HorizontalAlignment = HorizontalAlignment.Center;
+            _txtDetail.TextAlignment = TextAlignment.Center;
+            _txtDetail.TextWrapping = TextWrapping.Wrap;
+            _txtDetail.Margin = new Thickness(0, 10, 0, 0);
+            usp.Children.Add(_txtDetail);
+
+            Grid stack = new Grid();
+            stack.Height = 10;
+            stack.Margin = new Thickness(0, 12, 0, 0);
+
+            Border stackTrack = new Border();
+            stackTrack.CornerRadius = new CornerRadius(5);
+            stackTrack.Background = BrSurface;
+            stack.Children.Add(stackTrack);
+
+            AddColumn(stack, new GridLength(0, GridUnitType.Star));
+            AddColumn(stack, new GridLength(0, GridUnitType.Star));
+            AddColumn(stack, new GridLength(1, GridUnitType.Star));
+
+            _barInUse = new Border();
+            _barInUse.CornerRadius = new CornerRadius(5, 0, 0, 5);
+            _barInUse.Margin = new Thickness(1, 1, 0, 1);
+            _barInUse.Background = BrGreen;
+            Grid.SetColumn(_barInUse, 0);
+            stack.Children.Add(_barInUse);
+
+            _barStandby = new Border();
+            _barStandby.Margin = new Thickness(0, 1, 0, 1);
+            _barStandby.Background = BrBlue;
+            Grid.SetColumn(_barStandby, 1);
+            stack.Children.Add(_barStandby);
+
+            _barFree = new Border();
+            _barFree.CornerRadius = new CornerRadius(0, 5, 5, 0);
+            _barFree.Margin = new Thickness(0, 1, 1, 1);
+            _barFree.Background = BrMuted;
+            Grid.SetColumn(_barFree, 2);
+            stack.Children.Add(_barFree);
+
+            _stack = stack;
+            stack.SizeChanged += delegate { RefreshStackWidths(); };
+            usp.Children.Add(stack);
+
+            _txtBreakdown = new TextBlock();
+            _txtBreakdown.FontSize = 11;
+            _txtBreakdown.HorizontalAlignment = HorizontalAlignment.Center;
+            _txtBreakdown.TextAlignment = TextAlignment.Center;
+            _txtBreakdown.TextWrapping = TextWrapping.Wrap;
+            _txtBreakdown.Margin = new Thickness(0, 8, 0, 0);
+            usp.Children.Add(_txtBreakdown);
+
+            TextBlock histLabel = new TextBlock();
+            histLabel.Text = "RIWAYAT 4 MENIT";
+            histLabel.FontSize = 10;
+            histLabel.FontWeight = FontWeights.Bold;
+            histLabel.Foreground = BrMuted;
+            histLabel.Margin = new Thickness(0, 16, 0, 6);
+            usp.Children.Add(histLabel);
+
+            usp.Children.Add(BuildHistoryChart());
+
+            return card;
+        }
+
+        private static UIElement BuildHistoryChart()
+        {
+            Border frame = new Border();
+            frame.Background = BrBg;
+            frame.CornerRadius = new CornerRadius(6);
+            frame.Height = 62;
+            frame.Padding = new Thickness(1);
+
+            Canvas cv = new Canvas();
+            cv.ClipToBounds = true;
+            frame.Child = cv;
+            _histCanvas = cv;
+
+            _histGridMid = new Line();
+            _histGridMid.Stroke = BrSurface;
+            _histGridMid.StrokeThickness = 1;
+            _histGridMid.StrokeDashArray = new DoubleCollection(new double[] { 3, 3 });
+            cv.Children.Add(_histGridMid);
+
+            _histGridHigh = new Line();
+            _histGridHigh.Stroke = BrSurface;
+            _histGridHigh.StrokeThickness = 1;
+            _histGridHigh.StrokeDashArray = new DoubleCollection(new double[] { 3, 3 });
+            cv.Children.Add(_histGridHigh);
+
+            LinearGradientBrush grad = new LinearGradientBrush();
+            grad.StartPoint = new Point(0, 0);
+            grad.EndPoint = new Point(0, 1);
+            grad.GradientStops.Add(new GradientStop(Color.FromArgb(0x66, 0x89, 0xB4, 0xFA), 0));
+            grad.GradientStops.Add(new GradientStop(Color.FromArgb(0x00, 0x89, 0xB4, 0xFA), 1));
+            grad.Freeze();
+
+            _histFill = new Polygon();
+            _histFill.Fill = grad;
+            cv.Children.Add(_histFill);
+
+            _histLine = new Polyline();
+            _histLine.Stroke = BrBlue;
+            _histLine.StrokeThickness = 1.6;
+            _histLine.StrokeLineJoin = PenLineJoin.Round;
+            cv.Children.Add(_histLine);
+
+            cv.SizeChanged += delegate { RedrawHistory(); };
+            return frame;
+        }
+
+        private static UIElement BuildControlCard()
+        {
+            Border card = MakeCard(new Thickness(0, 0, 10, 0));
+            StackPanel csp = new StackPanel();
+            card.Child = csp;
+            Grid.SetColumn(card, 1);
+
+            CardLabel(csp, "KONTROL", BrTeal);
+
+            _btnClean = new Button();
+            _btnClean.Content = "Bersihkan RAM";
+            _btnClean.Height = 46;
+            _btnClean.FontSize = 15;
+            _btnClean.FontWeight = FontWeights.Bold;
+            _btnClean.Margin = new Thickness(0, 12, 0, 0);
+            _btnClean.Style = ButtonStyle(BrBlue, BrBlueHi, BrBg);
+            csp.Children.Add(_btnClean);
+
+            _btnRefresh = new Button();
+            _btnRefresh.Content = "Refresh";
+            _btnRefresh.Height = 34;
+            _btnRefresh.Margin = new Thickness(0, 8, 0, 0);
+            _btnRefresh.FontSize = 12;
+            _btnRefresh.Style = ButtonStyle(BrSurface, BrSurfaceHi, BrText);
+            _btnRefresh.Click += delegate { UpdateDisplay(); };
+            csp.Children.Add(_btnRefresh);
+
+            _btnRestartExplorer = new Button();
+            _btnRestartExplorer.Content = "Restart Explorer";
+            _btnRestartExplorer.Height = 40;
+            _btnRestartExplorer.Margin = new Thickness(0, 14, 0, 0);
+            _btnRestartExplorer.FontSize = 13;
+            _btnRestartExplorer.FontWeight = FontWeights.Bold;
+            _btnRestartExplorer.Style = ButtonStyle(BrYellow, BrSurfaceHi, BrBg);
+            csp.Children.Add(_btnRestartExplorer);
+
+            _chkAggressive = new CheckBox();
+            _chkAggressive.Content = "Mode mendalam: proses sistem non-kritis + file cache";
+            _chkAggressive.FontSize = 11;
+            _chkAggressive.Foreground = BrSubtext;
+            // Sengaja OFF secara default: mode ini menyapu dwm, svchost dan explorer,
+            // yang bikin desktop tersendat dan biasanya meninggalkan mesin lebih
+            // lambat. Harus jadi pilihan sadar, bukan default.
+            _chkAggressive.IsChecked = false;
+            _chkAggressive.Margin = new Thickness(2, 14, 0, 0);
+            _chkAggressive.ToolTip =
+                "Menyapu working set semua proses kecuali yang kritis, plus system "
+                + "working set (file cache), dan mem-flush modified page list. "
+                + "Efeknya lebih besar tapi desktop bisa tersendat sesaat.";
+            csp.Children.Add(_chkAggressive);
+
+            StackPanel autoRow = new StackPanel();
+            autoRow.Orientation = Orientation.Horizontal;
+            autoRow.Margin = new Thickness(2, 8, 0, 0);
+
+            _chkAuto = new CheckBox();
+            _chkAuto.Content = "Auto bersihkan bila RAM di atas ";
+            _chkAuto.FontSize = 11;
+            _chkAuto.Foreground = BrSubtext;
+            _chkAuto.VerticalAlignment = VerticalAlignment.Center;
+            autoRow.Children.Add(_chkAuto);
+
+            _txtThreshold = new TextBox();
+            _txtThreshold.Text = "85";
+            _txtThreshold.Width = 34;
+            _txtThreshold.FontSize = 11;
+            _txtThreshold.Margin = new Thickness(4, 0, 2, 0);
+            _txtThreshold.Padding = new Thickness(2, 1, 2, 1);
+            _txtThreshold.VerticalAlignment = VerticalAlignment.Center;
+            _txtThreshold.Background = BrSurface;
+            _txtThreshold.Foreground = BrText;
+            _txtThreshold.BorderBrush = BrSurfaceHi;
+            _txtThreshold.BorderThickness = new Thickness(1);
+            autoRow.Children.Add(_txtThreshold);
+
+            TextBlock pctSuffix = new TextBlock();
+            pctSuffix.Text = "%";
+            pctSuffix.FontSize = 11;
+            pctSuffix.Foreground = BrSubtext;
+            pctSuffix.VerticalAlignment = VerticalAlignment.Center;
+            autoRow.Children.Add(pctSuffix);
+
+            csp.Children.Add(autoRow);
+
+            Button btnLog = new Button();
+            btnLog.Content = "Buka Log Pembersihan";
+            btnLog.Height = 30;
+            btnLog.Margin = new Thickness(2, 10, 0, 0);
+            btnLog.FontSize = 11;
+            btnLog.Style = ButtonStyle(BrSurface, BrSurfaceHi, BrText);
+            btnLog.Click += delegate { OpenLog(); };
+            csp.Children.Add(btnLog);
+
+            _txtStatus = new TextBlock();
+            _txtStatus.FontSize = 12;
+            _txtStatus.Foreground = BrTeal;
+            _txtStatus.TextWrapping = TextWrapping.Wrap;
+            _txtStatus.Margin = new Thickness(0, 14, 0, 0);
+            csp.Children.Add(_txtStatus);
+
+            // Disclaimer permanen, bukan diulang di setiap pesan hasil.
+            TextBlock disclaimer = new TextBlock();
+            disclaimer.Text =
+                "Pembersihan memindahkan halaman ke standby list / pagefile, bukan "
+                + "menghapusnya. Sesaat setelahnya sebagian aplikasi memuat ulang dari "
+                + "disk, jadi jangan harap sistem langsung terasa lebih cepat.";
+            disclaimer.FontSize = 10;
+            disclaimer.Foreground = BrMuted;
+            disclaimer.TextWrapping = TextWrapping.Wrap;
+            disclaimer.Margin = new Thickness(0, 12, 0, 0);
+            csp.Children.Add(disclaimer);
+
+            return card;
+        }
+
+        private static UIElement BuildProcessCard()
+        {
+            Border card = MakeCard(new Thickness(0));
+            Grid pg = new Grid();
+            AddRow(pg, GridLength.Auto);
+            AddRow(pg, new GridLength(1, GridUnitType.Star));
+            card.Child = pg;
+            Grid.SetColumn(card, 2);
+
+            TextBlock listLabel = new TextBlock();
+            listLabel.Text = "PROSES TERATAS BERDASARKAN PENGGUNAAN RAM (klik kanan untuk aksi)";
+            listLabel.FontSize = 12;
+            listLabel.FontWeight = FontWeights.Bold;
+            listLabel.Foreground = BrSubtext;
+            Grid.SetRow(listLabel, 0);
+            pg.Children.Add(listLabel);
+
+            ListView lv = new ListView();
+            lv.Margin = new Thickness(0, 8, 0, 0);
+            lv.Background = BrBg;
+            lv.BorderBrush = BrSurface;
+            lv.BorderThickness = new Thickness(1);
+            Grid.SetRow(lv, 1);
+            lv.ItemsSource = _procs;
+
+            GridView gv = new GridView();
+
+            GridViewColumn c1 = new GridViewColumn();
+            c1.Header = "Nama Proses";
+            c1.DisplayMemberBinding = new Binding("Name");
+            c1.Width = 280;
+            gv.Columns.Add(c1);
+
+            GridViewColumn c2 = new GridViewColumn();
+            c2.Header = "PID";
+            c2.DisplayMemberBinding = new Binding("Id");
+            c2.Width = 70;
+            gv.Columns.Add(c2);
+
+            GridViewColumn c3 = new GridViewColumn();
+            c3.Header = "RAM (MB)";
+            Binding memBinding = new Binding("MemMB");
+            memBinding.StringFormat = "N1";
+            c3.DisplayMemberBinding = memBinding;
+            c3.Width = 110;
+            gv.Columns.Add(c3);
+
+            lv.View = gv;
+
+            Style headerStyle = new Style(typeof(GridViewColumnHeader));
+            headerStyle.Setters.Add(new Setter(GridViewColumnHeader.BackgroundProperty, BrSurface));
+            headerStyle.Setters.Add(new Setter(GridViewColumnHeader.ForegroundProperty, BrText));
+            headerStyle.Setters.Add(new Setter(GridViewColumnHeader.BorderThicknessProperty, new Thickness(0)));
+            headerStyle.Setters.Add(new Setter(GridViewColumnHeader.PaddingProperty, new Thickness(6, 6, 6, 6)));
+            lv.Resources.Add(typeof(GridViewColumnHeader), headerStyle);
+
+            Style itemStyle = new Style(typeof(ListViewItem));
+            itemStyle.Setters.Add(new Setter(ListViewItem.ForegroundProperty, BrText));
+            itemStyle.Setters.Add(new Setter(ListViewItem.PaddingProperty, new Thickness(4, 2, 4, 2)));
+            lv.ItemContainerStyle = itemStyle;
+
+            ContextMenu cm = new ContextMenu();
+            MenuItem miClean = new MenuItem();
+            MenuItem miKill = new MenuItem();
+
+            miClean.Click += delegate { CleanSingle(cm.Tag as ProcItem); };
+            cm.Items.Add(miClean);
+            miKill.Click += delegate { KillSingle(cm.Tag as ProcItem); };
+            cm.Items.Add(miKill);
+
+            cm.Opened += delegate
+            {
+                // Selama menu terbuka, daftar tidak di-refresh supaya baris tidak
+                // bergeser / terganti di bawah kursor.
+                _menuOpen = true;
+
+                ProcItem sel = _lvProcs.SelectedItem as ProcItem;
+                cm.Tag = sel;
+                bool usable = sel != null && !_isCleaning;
+                miClean.IsEnabled = usable;
+                miKill.IsEnabled = usable;
+                miClean.Header = sel != null
+                    ? "Bersihkan '" + sel.Name + "'"
+                    : "Bersihkan proses ini";
+                miKill.Header = sel != null
+                    ? "Akhiri '" + sel.Name + "'"
+                    : "Akhiri proses ini";
+            };
+            cm.Closed += delegate { _menuOpen = false; };
+
+            lv.ContextMenu = cm;
+            _procMenu = cm;
+
+            lv.PreviewMouseRightButtonDown += delegate(object sender, MouseButtonEventArgs args)
+            {
+                DependencyObject src = args.OriginalSource as DependencyObject;
+                if (src == null) { return; }
+                ListViewItem container =
+                    ItemsControl.ContainerFromElement(lv, src) as ListViewItem;
+                if (container != null)
+                {
+                    container.IsSelected = true;
+                }
+            };
+
+            _lvProcs = lv;
+            pg.Children.Add(lv);
+
+            return card;
+        }
+
+        private static void WireEvents()
+        {
+            _btnClean.Click += delegate { CleanRam(false); };
+            _btnRestartExplorer.Click += delegate { RestartExplorer(); };
+            _txtThreshold.TextChanged += delegate { ValidateThreshold(false); };
+            _chkAuto.Checked += delegate { ValidateThreshold(true); };
+        }
+
+        private static Style ButtonStyle(Brush normal, Brush hover, Brush foreground)
+        {
+            Style st = new Style(typeof(Button));
+            st.Setters.Add(new Setter(Button.BackgroundProperty, normal));
+            st.Setters.Add(new Setter(Button.ForegroundProperty, foreground));
+            st.Setters.Add(new Setter(Button.BorderThicknessProperty, new Thickness(0)));
+            st.Setters.Add(new Setter(Button.CursorProperty, Cursors.Hand));
+
+            Trigger t = new Trigger();
+            t.Property = UIElement.IsMouseOverProperty;
+            t.Value = true;
+            t.Setters.Add(new Setter(Button.BackgroundProperty, hover));
+            st.Triggers.Add(t);
+
+            Trigger pressed = new Trigger();
+            pressed.Property = Button.IsPressedProperty;
+            pressed.Value = true;
+            pressed.Setters.Add(new Setter(Button.BackgroundProperty, hover));
+            st.Triggers.Add(pressed);
+
+            return st;
+        }
+
+        private static Brush Solid(Color c)
+        {
+            SolidColorBrush b = new SolidColorBrush(c);
+            b.Freeze();
+            return b;
+        }
+
+        private static Run Tint(string text, Brush color)
+        {
+            Run r = new Run(text);
+            r.Foreground = color;
+            return r;
+        }
+
+        // ===================== Render meter =====================
+
+        private static void RefreshFillWidth()
+        {
+            double avail = _meter.ActualWidth - 2.0;
+            if (avail <= 0) { return; }
+            double frac = Math.Max(0, Math.Min(100, _lastPct)) / 100.0;
+            _barFill.Width = frac * avail;
+        }
+
+        private static void RefreshStackWidths()
+        {
+            double inUse = Math.Max(0, _lastInUseFrac);
+            double standby = Math.Max(0, _lastStandbyFrac);
+            double free = 1.0 - inUse - standby;
+            if (free < 0) { free = 0; }
+
+            _stack.ColumnDefinitions[0].Width = new GridLength(inUse, GridUnitType.Star);
+            _stack.ColumnDefinitions[1].Width = new GridLength(standby, GridUnitType.Star);
+            _stack.ColumnDefinitions[2].Width = new GridLength(free, GridUnitType.Star);
+        }
+
+        private static void RedrawHistory()
+        {
+            if (_histCanvas == null) { return; }
+
+            double w = _histCanvas.ActualWidth;
+            double h = _histCanvas.ActualHeight;
+            if (w <= 1 || h <= 1) { return; }
+
+            _histGridMid.X1 = 0;
+            _histGridMid.X2 = w;
+            _histGridMid.Y1 = h * 0.5;
+            _histGridMid.Y2 = h * 0.5;
+
+            _histGridHigh.X1 = 0;
+            _histGridHigh.X2 = w;
+            _histGridHigh.Y1 = h * 0.15;
+            _histGridHigh.Y2 = h * 0.15;
+
+            int n = _history.Count;
+            if (n < 2)
+            {
+                _histLine.Points = new PointCollection();
+                _histFill.Points = new PointCollection();
+                return;
+            }
+
+            // Data terbaru rata kanan, jadi grafik "masuk" dari sisi kanan.
+            double step = w / (HistoryMax - 1);
+            double x0 = w - (n - 1) * step;
+            if (x0 < 0) { x0 = 0; }
+
+            PointCollection line = new PointCollection(n);
+            for (int i = 0; i < n; i++)
+            {
+                double pct = Math.Max(0, Math.Min(100, _history[i]));
+                double x = x0 + i * step;
+                double y = h - (pct / 100.0) * h;
+                if (y < 1) { y = 1; }
+                if (y > h - 1) { y = h - 1; }
+                line.Add(new Point(x, y));
+            }
+            _histLine.Points = line;
+
+            PointCollection area = new PointCollection(n + 2);
+            area.Add(new Point(line[0].X, h));
+            for (int i = 0; i < line.Count; i++) { area.Add(line[i]); }
+            area.Add(new Point(line[line.Count - 1].X, h));
+            _histFill.Points = area;
+        }
+
+        private static string FmtGb(ulong bytes)
+        {
+            return string.Format("{0:N2} GB", bytes / 1073741824.0);
+        }
+
+        // ===================== Tick & display =====================
+
+        private static void OnTick()
+        {
+            _tickCounter++;
+
+            // Snapshot proses cukup tiap 3 tick (6 detik); saat jendela
+            // tersembunyi di tray tidak ada yang melihat daftarnya.
+            bool snap = _window.IsVisible && _tickCounter % 3 == 0;
+            UpdateDisplay(snap);
+
+            // Saat di tray, trim ulang tiap ~1 menit supaya footprint tetap
+            // rendah walau timer dan tooltip sesekali memfault halaman balik.
+            if (!_window.IsVisible && _tickCounter % 12 == 0)
+            {
+                TrimOwnWorkingSet();
+            }
+
+            CheckAutoClean();
+        }
+
+        private static void UpdateDisplay(bool snapshotProcesses = true)
+        {
+            try
+            {
+                MemApi.MEMORYSTATUSEX s;
+                if (!MemApi.TryGetStatus(out s))
+                {
+                    // Jangan tampilkan 0% seolah-olah itu data valid. _lastPct
+                    // dibuat negatif supaya CheckAutoClean tidak memakai angka
+                    // basi dari tick sebelumnya.
+                    _lastPct = -1;
+                    _txtUsage.Text = "?";
+                    _txtUsage.Foreground = BrRed;
+                    _txtDetail.Text = "GlobalMemoryStatusEx gagal (error "
+                        + Marshal.GetLastWin32Error() + ")";
+                    Tray.SetTooltip("RAM Cleaner - status memori tidak terbaca");
+                    return;
+                }
+
+                int pct = (int)s.dwMemoryLoad;
+                _lastPct = pct;
+
+                Brush meterBrush;
+                if (pct < 60) { meterBrush = BrGreen; }
+                else if (pct < 85) { meterBrush = BrYellow; }
+                else { meterBrush = BrRed; }
+
+                _txtUsage.Text = pct + "%";
+                _txtUsage.Foreground = meterBrush;
+                _barFill.Background = meterBrush;
+                RefreshFillWidth();
+
+                ulong used = s.ullTotalPhys - s.ullAvailPhys;
+                _txtDetail.Text = string.Format(
+                    "Terpakai {0}   |   Total {1}   |   Tersedia {2}",
+                    FmtGb(used), FmtGb(s.ullTotalPhys), FmtGb(s.ullAvailPhys));
+
+                UpdateBreakdown();
+                PushHistory(pct);
+
+                Tray.SetTooltip("RAM Cleaner - " + pct + "% terpakai");
+
+                // Enumerasi seluruh proses itu mahal; hanya saat diminta, tidak
+                // sedang membersihkan, dan menu konteks tidak terbuka.
+                if (snapshotProcesses && !_isCleaning && !_menuOpen)
+                {
+                    MergeProcesses(SnapshotProcesses());
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Write("UpdateDisplay gagal: " + ex.Message);
+            }
+        }
+
+        private static void UpdateBreakdown()
+        {
+            MemApi.MemBreakdown b = MemApi.GetBreakdown();
+            if (b.TotalBytes == 0)
+            {
+                _txtBreakdown.Inlines.Clear();
+                _txtBreakdown.Inlines.Add(Tint("Rincian memori tidak tersedia", BrMuted));
+                return;
+            }
+
+            double total = b.TotalBytes;
+            _lastInUseFrac = b.InUseBytes / total;
+            _lastStandbyFrac = b.StandbyBytes / total;
+            RefreshStackWidths();
+
+            _txtBreakdown.Inlines.Clear();
+            _txtBreakdown.Inlines.Add(Tint("● ", BrGreen));
+            _txtBreakdown.Inlines.Add(Tint("Terpakai " + FmtGb(b.InUseBytes) + "   ", BrSubtext));
+            _txtBreakdown.Inlines.Add(Tint("● ", BrBlue));
+            _txtBreakdown.Inlines.Add(Tint("Standby " + FmtGb(b.StandbyBytes) + "   ", BrSubtext));
+            _txtBreakdown.Inlines.Add(Tint("● ", BrMuted));
+            _txtBreakdown.Inlines.Add(Tint("Bebas " + FmtGb(b.FreeBytes), BrSubtext));
+
+            if (!b.Accurate)
+            {
+                _txtBreakdown.Inlines.Add(Tint("   (perkiraan)", BrMuted));
+            }
+        }
+
+        private static void PushHistory(int pct)
+        {
+            _history.Add(pct);
+            if (_history.Count > HistoryMax)
+            {
+                _history.RemoveRange(0, _history.Count - HistoryMax);
+            }
+            RedrawHistory();
+        }
+
+        // ===================== Daftar proses =====================
+
+        private static List<ProcItem> SnapshotProcesses()
+        {
+            List<ProcItem> list = new List<ProcItem>();
+            Process[] procs = Process.GetProcesses();
+            foreach (Process p in procs)
+            {
+                try
+                {
+                    long ws = p.WorkingSet64;
+                    if (ws <= 10485760L) { continue; }
+
+                    ProcItem it = new ProcItem();
+                    it.Name = p.ProcessName;
+                    it.Id = p.Id;
+                    it.MemMB = Math.Round(ws / 1048576.0, 1);
+                    it.StartTicks = SafeStartTicks(p);
+                    list.Add(it);
+                }
+                catch { }
+                finally
+                {
+                    try { p.Dispose(); } catch { }
+                }
+            }
+
+            list.Sort(delegate(ProcItem a, ProcItem b) { return b.MemMB.CompareTo(a.MemMB); });
+            if (list.Count > 25)
+            {
+                list.RemoveRange(25, list.Count - 25);
+            }
+            return list;
+        }
+
+        private static long SafeStartTicks(Process p)
+        {
+            // StartTime melempar Access Denied untuk sebagian proses sistem.
+            try { return p.StartTime.Ticks; }
+            catch { return 0; }
+        }
+
+        // Update di tempat supaya seleksi dan posisi scroll tidak hilang setiap
+        // 2 detik (dulu ItemsSource diganti dengan List baru).
+        private static void MergeProcesses(List<ProcItem> snap)
+        {
+            Dictionary<int, ProcItem> byId = new Dictionary<int, ProcItem>(snap.Count);
+            for (int i = 0; i < snap.Count; i++)
+            {
+                byId[snap[i].Id] = snap[i];
+            }
+
+            for (int i = _procs.Count - 1; i >= 0; i--)
+            {
+                if (!byId.ContainsKey(_procs[i].Id))
+                {
+                    _procs.RemoveAt(i);
+                }
+            }
+
+            // Samakan urutan dengan snapshot. Invarian: setelah indeks i
+            // diproses, posisi 0..i-1 persis sama dengan snapshot 0..i-1,
+            // jadi urutan tidak bergeser meleset setelah ada proses keluar.
+            for (int i = 0; i < snap.Count; i++)
+            {
+                ProcItem fresh = snap[i];
+                int cur = IndexOfPid(fresh.Id);
+                if (cur < 0)
+                {
+                    _procs.Insert(i, fresh);
+                    continue;
+                }
+
+                ProcItem existing = _procs[cur];
+                existing.Name = fresh.Name;
+                existing.MemMB = fresh.MemMB;
+                existing.StartTicks = fresh.StartTicks;
+                if (cur != i)
+                {
+                    _procs.Move(cur, i);
+                }
+            }
+        }
+
+        private static int IndexOfPid(int pid)
+        {
+            for (int i = 0; i < _procs.Count; i++)
+            {
+                if (_procs[i].Id == pid) { return i; }
+            }
+            return -1;
+        }
+
+        // Memastikan PID masih milik proses yang sama sebelum kita bertindak.
+        // Tanpa ini, PID yang sudah didaur ulang Windows bisa membuat kita
+        // membersihkan - atau mengakhiri - proses yang sama sekali berbeda.
+        private static Process ResolveVerified(ProcItem it, out string error)
+        {
+            error = null;
+            Process p = null;
+            try
+            {
+                p = Process.GetProcessById(it.Id);
+            }
+            catch
+            {
+                error = "Proses sudah tidak berjalan.";
+                return null;
+            }
+
+            try
+            {
+                if (!string.Equals(p.ProcessName, it.Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    error = "PID " + it.Id + " sekarang dipakai proses lain ('"
+                        + p.ProcessName + "'). Dibatalkan.";
+                    p.Dispose();
+                    return null;
+                }
+
+                long ticks = SafeStartTicks(p);
+                if (it.StartTicks != 0 && ticks != 0 && ticks != it.StartTicks)
+                {
+                    error = "PID " + it.Id + " sudah didaur ulang oleh proses baru. Dibatalkan.";
+                    p.Dispose();
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                try { p.Dispose(); } catch { }
+                return null;
+            }
+
+            return p;
+        }
+
+        // ===================== Status helper =====================
+
+        private static void SetStatusUi(string text)
+        {
+            _txtStatus.Text = text;
+        }
+
+        // Dipanggil dari thread pembersih.
+        private static void Status(string text)
+        {
+            string captured = text;
+            _window.Dispatcher.BeginInvoke(new Action(delegate { SetStatusUi(captured); }));
+        }
+
+        private static void SetBusy(bool busy)
+        {
+            _btnClean.IsEnabled = !busy;
+            _btnRestartExplorer.IsEnabled = !busy;
+            _btnRefresh.IsEnabled = !busy;
+            if (busy && _procMenu != null) { _procMenu.IsOpen = false; }
+        }
+
+        // ===================== Pembersihan =====================
+
+        private sealed class CleanOutcome
+        {
+            public bool Deep;
+            public bool FromAuto;
+            public int Rounds;
+            public int DistinctProcesses;
+            public bool PrivProfile;
+            public bool PrivQuota;
+            public bool StatusOk;
+            public int PctBefore;
+            public int PctAfter;
+            public double FreedMb;
+            public readonly Dictionary<string, string> Failures =
+                new Dictionary<string, string>();
+        }
+
+        private static void Note(CleanOutcome o, string stage, string err)
+        {
+            if (err == null) { return; }
+            // Kegagalan diakumulasi per tahap, bukan ditimpa tiap putaran.
+            o.Failures[stage] = err;
+        }
+
+        private static void CleanRam(bool fromAuto)
+        {
+            if (_isCleaning) { return; }
+
+            int threshold;
+            if (fromAuto && !TryThreshold(out threshold)) { return; }
+
+            _isCleaning = true;
+            SetBusy(true);
+
+            bool deep = _chkAggressive.IsChecked == true;
+
+            // Cast eksplisit: anonymous method tanpa parameter bisa dikonversi ke
+            // ThreadStart maupun ParameterizedThreadStart (CS0121 di csc lama).
+            Thread worker = new Thread((ThreadStart)delegate { CleanWorker(deep, fromAuto); });
+            worker.IsBackground = true;
+            worker.Name = "RamCleanWorker";
+            worker.Start();
+        }
+
+        // Berjalan di thread background. Seluruh P/Invoke di sini tidak butuh UI
+        // thread, jadi jendela tetap responsif (dulu semuanya di UI thread dengan
+        // Thread.Sleep + DoEvents manual).
+        private static void CleanWorker(bool deep, bool fromAuto)
+        {
+            CleanOutcome o = new CleanOutcome();
+            o.Deep = deep;
+            o.FromAuto = fromAuto;
+
+            try
+            {
+                Status("Menyiapkan hak istimewa sistem...");
+
+                // Dua panggilan terpisah: dengan && yang kedua tidak pernah dicoba
+                // kalau yang pertama gagal, padahal keduanya independen.
+                o.PrivProfile = Privilege.Enable("SeProfileSingleProcessPrivilege");
+                o.PrivQuota = Privilege.Enable("SeIncreaseQuotaPrivilege");
+                if (!o.PrivProfile)
+                {
+                    Note(o, "SeProfileSingleProcessPrivilege", "tidak bisa diaktifkan");
+                }
+                if (!o.PrivQuota)
+                {
+                    Note(o, "SeIncreaseQuotaPrivilege", "tidak bisa diaktifkan");
+                }
+
+                MemApi.MEMORYSTATUSEX before;
+                o.StatusOk = MemApi.TryGetStatus(out before);
+                o.PctBefore = (int)before.dwMemoryLoad;
+
+                string[] excl = deep ? ExcludedCritical : Excluded;
+                int maxRounds = deep ? 6 : 2;
+                HashSet<int> touched = new HashSet<int>();
+                double prevAvailMb = -1;
+
+                for (int r = 1; r <= maxRounds; r++)
+                {
+                    Status(string.Format(
+                        deep
+                            ? "Putaran {0}/{1}: membersihkan working set semua proses..."
+                            : "Membersihkan ({0}/{1})...",
+                        r, maxRounds));
+
+                    SweepProcesses(excl, touched);
+                    Thread.Sleep(deep ? 300 : 80);
+
+                    if (deep)
+                    {
+                        // Mengosongkan system working set, termasuk file cache.
+                        // Menggantikan SetSystemFileCacheSize yang lama: cara itu
+                        // bisa meninggalkan batas cache terkunci di 0 sampai reboot
+                        // bila proses restore gagal.
+                        Note(o, "Empty working set sistem",
+                            MemApi.RunCommand(MemApi.CmdEmptyWorkingSets));
+                        Thread.Sleep(150);
+
+                        // Halaman kotor ditulis ke disk lalu jadi standby, supaya
+                        // purge standby di bawah benar-benar bisa melepasnya.
+                        Note(o, "Flush modified page list",
+                            MemApi.RunCommand(MemApi.CmdFlushModifiedList));
+                        Thread.Sleep(150);
+                    }
+
+                    Note(o, "Purge standby prioritas rendah",
+                        MemApi.RunCommand(MemApi.CmdPurgeLowPriorityStandbyList));
+                    Thread.Sleep(120);
+                    Note(o, "Purge standby list",
+                        MemApi.RunCommand(MemApi.CmdPurgeStandbyList));
+                    Thread.Sleep(deep ? 350 : 200);
+
+                    o.Rounds = r;
+
+                    MemApi.MEMORYSTATUSEX probe;
+                    if (!MemApi.TryGetStatus(out probe)) { break; }
+
+                    double availMb = probe.ullAvailPhys / 1048576.0;
+                    if (prevAvailMb >= 0 && (availMb - prevAvailMb) < 30)
+                    {
+                        break;   // hasil sudah konvergen
+                    }
+                    prevAvailMb = availMb;
+                }
+
+                Status("Menutup: membersihkan working set aplikasi ini...");
+                try { MemApi.EmptyWorkingSet(MemApi.GetCurrentProcess()); } catch { }
+
+                Thread.Sleep(500);
+
+                MemApi.MEMORYSTATUSEX after;
+                if (MemApi.TryGetStatus(out after))
+                {
+                    o.PctAfter = (int)after.dwMemoryLoad;
+                    long usedBefore = (long)(before.ullTotalPhys - before.ullAvailPhys);
+                    long usedAfter = (long)(after.ullTotalPhys - after.ullAvailPhys);
+                    double freed = (usedBefore - usedAfter) / 1048576.0;
+                    o.FreedMb = freed < 0 ? 0 : freed;
+                }
+                else
+                {
+                    o.StatusOk = false;
+                }
+
+                o.DistinctProcesses = touched.Count;
+            }
+            catch (Exception ex)
+            {
+                Note(o, "Kesalahan tak terduga", ex.Message);
+                Log.Write("CleanWorker gagal: " + ex);
+            }
+
+            CleanOutcome captured = o;
+            _window.Dispatcher.BeginInvoke(new Action(delegate { FinishClean(captured); }));
+        }
+
+        private static void FinishClean(CleanOutcome o)
+        {
+            try
+            {
+                string modeText = o.Deep
+                    ? "mode mendalam, " + o.Rounds + " putaran adaptif"
+                    : "mode cepat, " + o.Rounds + " putaran";
+
+                StringBuilder sb = new StringBuilder();
+                if (o.FromAuto) { sb.Append("[AUTO] "); }
+
+                // "DistinctProcesses" adalah jumlah PID unik, bukan akumulasi
+                // per putaran (dulu 6 putaran x ~150 proses dilaporkan sebagai 900).
+                sb.Append(string.Format(
+                    "Selesai. {0} proses diproses ({1}).",
+                    o.DistinctProcesses, modeText));
+
+                if (o.StatusOk)
+                {
+                    sb.Append(string.Format(
+                        "\nRAM tersedia naik sekitar {0:N0} MB ({1}% → {2}%).",
+                        o.FreedMb, o.PctBefore, o.PctAfter));
+                }
+                else
+                {
+                    sb.Append("\nStatus memori tidak bisa dibaca, selisih tidak dihitung.");
+                }
+
+                if (o.Failures.Count > 0)
+                {
+                    List<string> parts = new List<string>();
+                    foreach (KeyValuePair<string, string> kv in o.Failures)
+                    {
+                        parts.Add(kv.Key + " (" + kv.Value + ")");
+                    }
+                    sb.Append("\nTahap gagal: " + string.Join("; ", parts.ToArray()));
+                }
+
+                string msg = sb.ToString();
+                SetStatusUi(msg);
+                Log.Write(msg.Replace("\n", " | "));
+
+                if (o.FromAuto && Tray.Active && !_window.IsVisible)
+                {
+                    Tray.Balloon("RAM Cleaner - auto bersih",
+                        string.Format("{0}% → {1}%, sekitar {2:N0} MB dilepas.",
+                            o.PctBefore, o.PctAfter, o.FreedMb));
+                }
+
+                UpdateDisplay();
+            }
+            finally
+            {
+                _lastCleanTicks = Environment.TickCount;
+                _isCleaning = false;
+                SetBusy(false);
+            }
+        }
+
+        private static void SweepProcesses(string[] excluded, HashSet<int> touched)
+        {
+            Process[] procs = Process.GetProcesses();
+            foreach (Process p in procs)
+            {
+                try
+                {
+                    if (p.Id == _ownPid) { continue; }
+                    // ToLowerInvariant: ToLower() bergantung culture, dan di tr-TR
+                    // "WININIT" jadi "wınınıt" sehingga daftar pengecualian bocor.
+                    if (Array.IndexOf(excluded, p.ProcessName.ToLowerInvariant()) >= 0)
+                    {
+                        continue;
+                    }
+                    // Process.Handle melempar bila akses ditolak - itu jalur
+                    // normal untuk proses terlindungi, bukan error yang perlu dicatat.
+                    if (MemApi.EmptyWorkingSet(p.Handle))
+                    {
+                        touched.Add(p.Id);
+                    }
+                }
+                catch { }
+                finally
+                {
+                    try { p.Dispose(); } catch { }
+                }
+            }
+        }
+
+        // ===================== Auto clean =====================
+
+        private static bool TryThreshold(out int value)
+        {
+            value = 0;
+            if (_txtThreshold == null) { return false; }
+            string raw = _txtThreshold.Text.Trim();
+            if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+            {
+                return false;
+            }
+            return value >= 50 && value <= 99;
+        }
+
+        private static void ValidateThreshold(bool announce)
+        {
+            int t;
+            bool ok = TryThreshold(out t);
+            _txtThreshold.BorderBrush = ok ? BrSurfaceHi : BrRed;
+            _txtThreshold.ToolTip = ok ? null : "Masukkan angka bulat 50-99";
+
+            // Dulu ambang tidak valid membuat auto-clean mati tanpa tanda apa pun.
+            if (!ok && (announce || _chkAuto.IsChecked == true))
+            {
+                SetStatusUi("Ambang auto-clean tidak valid (harus 50-99). Auto-clean nonaktif.");
+            }
+        }
+
+        private static void CheckAutoClean()
+        {
+            if (_isCleaning || _chkAuto.IsChecked != true) { return; }
+
+            int t;
+            if (!TryThreshold(out t)) { return; }
+            if (_lastPct < t) { return; }
+
+            // Environment.TickCount monotonik. DateTime.Now bisa melompat mundur
+            // (DST, koreksi NTP, user ubah jam) dan mematikan auto-clean sampai
+            // sepanjang lompatan itu.
+            int elapsed = unchecked(Environment.TickCount - _lastCleanTicks);
+            if (elapsed < 60000) { return; }
+
+            CleanRam(true);
+        }
+
+        // ===================== Aksi per proses =====================
+
+        private static void CleanSingle(ProcItem it)
+        {
+            if (it == null) { return; }
+            // Guard yang dulu tidak ada: tanpa ini aksi ini bisa berjalan
+            // bersamaan dengan CleanRam dan saling menimpa status.
+            if (_isCleaning) { return; }
+
+            string err;
+            Process p = ResolveVerified(it, out err);
+            if (p == null)
+            {
+                SetStatusUi(err);
+                return;
+            }
+
+            long beforeWs = 0;
+            bool ok = false;
+            int wsError = 0;
+            try
+            {
+                beforeWs = p.WorkingSet64;
+                ok = MemApi.EmptyWorkingSet(p.Handle);
+                if (!ok)
+                {
+                    // Ditangkap di sini: p.Dispose() di finally bisa menimpa
+                    // last-error thread sebelum pesan disusun.
+                    wsError = Marshal.GetLastWin32Error();
+                }
+            }
+            catch (Exception ex)
+            {
+                SetStatusUi("Gagal membersihkan '" + it.Name + "': " + ex.Message);
+                return;
+            }
+            finally
+            {
+                try { p.Dispose(); } catch { }
+            }
+
+            if (!ok)
+            {
+                SetStatusUi("Gagal membersihkan '" + it.Name + "' (error "
+                    + wsError + ").");
+                return;
+            }
+
+            double freed = 0;
+            try
+            {
+                using (Process again = Process.GetProcessById(it.Id))
+                {
+                    freed = Math.Max(0, (beforeWs - again.WorkingSet64) / 1048576.0);
+                }
+            }
+            catch { }
+
+            UpdateDisplay();
+            string msg = string.Format(
+                "Proses '{0}' dibersihkan (sekitar {1:N0} MB dilepas).", it.Name, freed);
+            SetStatusUi(msg);
+            Log.Write(msg);
+        }
+
+        private static void KillSingle(ProcItem it)
+        {
+            if (it == null) { return; }
+            if (_isCleaning) { return; }
+
+            // Mengakhiri proses ini akan membuat Windows bluescreen atau logout paksa.
+            if (Array.IndexOf(ExcludedCritical, it.Name.ToLowerInvariant()) >= 0)
+            {
+                SetStatusUi("'" + it.Name + "' adalah proses kritis Windows - "
+                    + "mengakhirinya akan membuat sistem crash. Dibatalkan.");
+                return;
+            }
+
+            MessageBoxResult r = MessageBox.Show(
+                "Akhiri proses '" + it.Name + "' (PID " + it.Id + ")?\n\n" +
+                "Data yang belum disimpan di aplikasi tersebut akan HILANG.\n" +
+                "Proses tidak diberi kesempatan menyimpan apa pun.",
+                "Akhiri Proses",
+                MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+            if (r != MessageBoxResult.OK) { return; }
+
+            // Diverifikasi ulang SETELAH dialog: selama dialog terbuka proses bisa
+            // keluar dan PID-nya dipakai proses lain.
+            string err;
+            Process p = ResolveVerified(it, out err);
+            if (p == null)
+            {
+                SetStatusUi(err);
+                return;
+            }
+
+            try
+            {
+                p.Kill();
+                p.WaitForExit(3000);
+                string msg = "Proses '" + it.Name + "' (PID " + it.Id + ") diakhiri.";
+                SetStatusUi(msg);
+                Log.Write(msg);
+            }
+            catch (Exception ex)
+            {
+                SetStatusUi("Gagal mengakhiri '" + it.Name + "': " + ex.Message);
+            }
+            finally
+            {
+                try { p.Dispose(); } catch { }
+            }
+
+            UpdateDisplay();
+        }
+
+        // ===================== Log =====================
+
+        private static void OpenLog()
+        {
+            string err = Log.Open();
+            if (err != null)
+            {
+                SetStatusUi("Gagal membuka log: " + err);
+            }
+        }
+
+        // ===================== Restart Explorer =====================
+
+        private static void RestartExplorer()
+        {
+            if (_isCleaning) { return; }
+
+            MessageBoxResult r = MessageBox.Show(
+                "Restart Windows Explorer?\n\n" +
+                "Taskbar & desktop hilang sebentar (2-5 detik).\n" +
+                "Jendela File Explorer yang terbuka akan tertutup.\n" +
+                "Aplikasi lain TIDAK terpengaruh.",
+                "Restart Explorer",
+                MessageBoxButton.OKCancel, MessageBoxImage.Question);
+            if (r != MessageBoxResult.OK) { return; }
+
+            _isCleaning = true;
+            SetBusy(true);
+
+            Thread worker = new Thread((ThreadStart)delegate { RestartExplorerWorker(); });
+            worker.IsBackground = true;
+            worker.Name = "RestartExplorerWorker";
+            worker.Start();
+        }
+
+        private static void RestartExplorerWorker()
+        {
+            string result;
+            try
+            {
+                Status("Mematikan explorer.exe...");
+                KillExplorerInSession();
+
+                // Windows biasanya menjalankan ulang shell sendiri (AutoRestartShell).
+                // Tunggu sampai 6 detik sebelum turun ke jalur manual.
+                Status("Menunggu Windows menjalankan ulang shell...");
+                bool back = false;
+                for (int i = 0; i < 12; i++)
+                {
+                    Thread.Sleep(500);
+                    if (CountExplorerInSession() > 0) { back = true; break; }
+                }
+
+                if (!back)
+                {
+                    Status("Menjalankan ulang explorer.exe secara manual...");
+                    string err = StartExplorer();
+                    if (err != null)
+                    {
+                        result = "Gagal menjalankan ulang explorer: " + err
+                            + "\nBuka manual: Ctrl+Shift+Esc > Run new task > explorer.exe";
+                    }
+                    else
+                    {
+                        Thread.Sleep(1200);
+                        back = CountExplorerInSession() > 0;
+                        result = back
+                            ? "Explorer berhasil direstart. Memori shell kembali ke ukuran awal."
+                            : "Explorer belum muncul. Buka manual: Ctrl+Shift+Esc > Run new task > explorer.exe";
+                    }
+                }
+                else
+                {
+                    result = "Explorer berhasil direstart. Memori shell kembali ke ukuran awal.";
+                }
+            }
+            catch (Exception ex)
+            {
+                result = "Terjadi kesalahan: " + ex.Message;
+                Log.Write("RestartExplorer gagal: " + ex);
+            }
+
+            string captured = result;
+            _window.Dispatcher.BeginInvoke(new Action(delegate
+            {
+                SetStatusUi(captured);
+                Log.Write(captured.Replace("\n", " | "));
+                UpdateDisplay();
+                _isCleaning = false;
+                SetBusy(false);
+            }));
+        }
+
+        // Hanya shell di sesi kita. Process.GetProcessesByName cakupannya
+        // seluruh mesin, jadi tanpa filter ini shell user lain (RDP / fast user
+        // switching) juga ikut dimatikan.
+        private static void KillExplorerInSession()
+        {
+            Process[] ps = Process.GetProcessesByName("explorer");
+            foreach (Process p in ps)
+            {
+                try
+                {
+                    if (p.SessionId == _ownSessionId) { p.Kill(); }
+                }
+                catch { }
+                finally
+                {
+                    try { p.Dispose(); } catch { }
+                }
+            }
+        }
+
+        private static int CountExplorerInSession()
+        {
+            int n = 0;
+            Process[] ps = Process.GetProcessesByName("explorer");
+            foreach (Process p in ps)
+            {
+                try
+                {
+                    if (p.SessionId == _ownSessionId) { n++; }
+                }
+                catch { }
+                finally
+                {
+                    try { p.Dispose(); } catch { }
+                }
+            }
+            return n;
+        }
+
+        private static string StartExplorer()
+        {
+            // explorer.exe ada di %WINDIR%, BUKAN di System32.
+            string winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            string exe = IOPath.Combine(winDir, "explorer.exe");
+            try
+            {
+                Process p = Process.Start(new ProcessStartInfo
+                {
+                    FileName = File.Exists(exe) ? exe : "explorer.exe",
+                    UseShellExecute = true
+                });
+                if (p != null) { p.Dispose(); }
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
+            }
+        }
+    }
+}

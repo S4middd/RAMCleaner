@@ -1,0 +1,1182 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Documents;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Threading;
+
+namespace RamCleaner
+{
+    internal static class MemApi
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MEMORYSTATUSEX
+        {
+            public uint dwLength;
+            public uint dwMemoryLoad;
+            public ulong ullTotalPhys;
+            public ulong ullAvailPhys;
+            public ulong ullTotalPageFile;
+            public ulong ullAvailPageFile;
+            public ulong ullTotalVirtual;
+            public ulong ullAvailVirtual;
+            public ulong ullAvailExtendedVirtual;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PERFORMANCE_INFORMATION
+        {
+            public uint cb;
+            public IntPtr CommitTotal;
+            public IntPtr CommitLimit;
+            public IntPtr CommitPeak;
+            public IntPtr PhysicalTotal;
+            public IntPtr PhysicalAvailable;
+            public IntPtr SystemCache;
+            public IntPtr KernelTotal;
+            public IntPtr KernelPaged;
+            public IntPtr KernelNonpaged;
+            public IntPtr PageSize;
+            public uint HandleCount;
+            public uint ProcessCount;
+            public uint ThreadCount;
+        }
+
+        public struct MemBreakdown
+        {
+            public ulong TotalBytes;
+            public ulong InUseBytes;
+            public ulong StandbyBytes;
+            public ulong FreeBytes;
+        }
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        public static extern bool GetPerformanceInfo(out PERFORMANCE_INFORMATION pPerformanceInformation, uint cb);
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        public static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+        [DllImport("ntdll.dll")]
+        public static extern int NtSetSystemInformation(int infoClass, ref int info, int length);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetSystemFileCacheSize(
+            out IntPtr minimumFileCacheSize, out IntPtr maximumFileCacheSize, out uint flags);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool SetSystemFileCacheSize(
+            IntPtr minimumFileCacheSize, IntPtr maximumFileCacheSize, uint flags);
+
+        public const int SystemMemoryListInformation = 80;
+
+        // Perintah yang masih didukung Windows modern (diverifikasi):
+        public const int CmdPurgeStandbyList = 4;
+        public const int CmdPurgeLowPriorityStandbyList = 5;
+
+        public static MEMORYSTATUSEX GetStatus()
+        {
+            MEMORYSTATUSEX s = new MEMORYSTATUSEX();
+            s.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+            GlobalMemoryStatusEx(ref s);
+            return s;
+        }
+
+        public static MemBreakdown GetBreakdown()
+        {
+            PERFORMANCE_INFORMATION pi;
+            pi.cb = (uint)Marshal.SizeOf(typeof(PERFORMANCE_INFORMATION));
+            MemBreakdown b = new MemBreakdown();
+            if (!GetPerformanceInfo(out pi, pi.cb))
+            {
+                return b;
+            }
+            long pageSize = pi.PageSize.ToInt64();
+            if (pageSize <= 0) { pageSize = 4096; }
+            long total = pi.PhysicalTotal.ToInt64() * pageSize;
+            long avail = pi.PhysicalAvailable.ToInt64() * pageSize;
+            long cache = pi.SystemCache.ToInt64() * pageSize;
+            b.TotalBytes = (ulong)total;
+            b.InUseBytes = (ulong)(total - avail);
+            b.StandbyBytes = (ulong)cache;
+            long freeBytes = avail - cache;
+            b.FreeBytes = (ulong)(freeBytes < 0 ? 0 : freeBytes);
+            return b;
+        }
+    }
+
+    internal static class Privilege
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LUID
+        {
+            public uint LowPart;
+            public int HighPart;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct TOKEN_PRIVILEGES
+        {
+            public int PrivilegeCount;
+            public LUID Luid;
+            public int Attributes;
+        }
+
+        private const uint TOKEN_ADJUST_PRIVILEGES = 0x20;
+        private const uint TOKEN_QUERY = 0x8;
+        private const int SE_PRIVILEGE_ENABLED = 0x2;
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool LookupPrivilegeValue(string systemName, string name, out LUID luid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool AdjustTokenPrivileges(
+            IntPtr tokenHandle, bool disableAllPrivileges,
+            ref TOKEN_PRIVILEGES newState, int bufferLength,
+            IntPtr previousState, IntPtr returnLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public static bool Enable(string privilegeName)
+        {
+            try
+            {
+                IntPtr token;
+                if (!OpenProcessToken(Process.GetCurrentProcess().Handle,
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out token))
+                {
+                    return false;
+                }
+
+                LUID luid;
+                bool found = LookupPrivilegeValue(null, privilegeName, out luid);
+                if (!found)
+                {
+                    CloseHandle(token);
+                    return false;
+                }
+
+                TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
+                tp.PrivilegeCount = 1;
+                tp.Luid = luid;
+                tp.Attributes = SE_PRIVILEGE_ENABLED;
+
+                bool ok = AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+                int err = Marshal.GetLastWin32Error();
+                CloseHandle(token);
+                return ok && err == 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
+    public class ProcItem
+    {
+        public string Name { get; set; }
+        public int Id { get; set; }
+        public double MemMB { get; set; }
+    }
+
+    internal static class Program
+    {
+        private static readonly Color ColBg = Color.FromRgb(0x1E, 0x1E, 0x2E);
+        private static readonly Color ColPanel = Color.FromRgb(0x18, 0x18, 0x25);
+        private static readonly Color ColSurface = Color.FromRgb(0x31, 0x32, 0x44);
+        private static readonly Color ColSurfaceHi = Color.FromRgb(0x45, 0x47, 0x5A);
+        private static readonly Color ColText = Color.FromRgb(0xCD, 0xD6, 0xF4);
+        private static readonly Color ColSubtext = Color.FromRgb(0xA6, 0xAD, 0xC8);
+        private static readonly Color ColBlue = Color.FromRgb(0x89, 0xB4, 0xFA);
+        private static readonly Color ColBlueHi = Color.FromRgb(0xB4, 0xBE, 0xFE);
+        private static readonly Color ColGreen = Color.FromRgb(0xA6, 0xE3, 0xA1);
+        private static readonly Color ColYellow = Color.FromRgb(0xF9, 0xE2, 0xAF);
+        private static readonly Color ColRed = Color.FromRgb(0xF3, 0x8B, 0xA8);
+        private static readonly Color ColTeal = Color.FromRgb(0x94, 0xE2, 0xD5);
+
+        private static Window _window;
+        private static TextBlock _txtUsage;
+        private static Grid _meter;
+        private static Border _barFill;
+        private static TextBlock _txtDetail;
+        private static Button _btnClean;
+        private static Button _btnRestartExplorer;
+        private static CheckBox _chkAggressive;
+        private static TextBlock _txtStatus;
+        private static ListView _lvProcs;
+        private static DispatcherTimer _timer;
+        private static int _lastPct;
+        private static CheckBox _chkAuto;
+        private static TextBox _txtThreshold;
+        private static bool _isCleaning;
+        private static DateTime _lastCleanTime = DateTime.MinValue;
+        private static Grid _stack;
+        private static Border _barInUse;
+        private static Border _barStandby;
+        private static Border _barFree;
+        private static TextBlock _txtBreakdown;
+        private static double _lastInUseFrac;
+        private static double _lastStandbyFrac;
+        private static readonly string LogPath = Path.Combine(
+            Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location),
+            "RAMCleaner_history.log");
+
+        private static readonly string[] Excluded = new string[]
+        {
+            "system", "idle", "registry", "memory compression", "secure system",
+            "memcompression", "smss", "csrss", "wininit", "winlogon",
+            "services", "lsass", "svchost", "dwm", "fontdrvhost",
+            "sihost", "explorer", "conhost", "wudfhost"
+        };
+
+        // Mode mendalam: hanya proses yang benar-benar kritis dilewati.
+        // svchost, dwm, explorer, dll. ikut dibersihkan seperti RAMMap.
+        private static readonly string[] ExcludedCritical = new string[]
+        {
+            "system", "idle", "registry", "memory compression", "secure system",
+            "memcompression", "smss", "csrss", "wininit", "winlogon",
+            "services", "lsass"
+        };
+
+        [STAThread]
+        public static void Main()
+        {
+            try
+            {
+                RunApp();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.ToString(), "RAM Cleaner - Error",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private static void RunApp()
+        {
+            Application app = new Application();
+
+            _window = BuildWindow();
+            WireEvents();
+
+            _window.SourceInitialized += delegate
+            {
+                HwndSource src = (HwndSource)PresentationSource.FromVisual(_window);
+                if (src != null)
+                {
+                    int on = 1;
+                    if (MemApi.DwmSetWindowAttribute(src.Handle, 20, ref on, 4) != 0)
+                    {
+                        MemApi.DwmSetWindowAttribute(src.Handle, 19, ref on, 4);
+                    }
+                }
+            };
+
+            bool isAdmin = new WindowsPrincipal(WindowsIdentity.GetCurrent())
+                .IsInRole(WindowsBuiltInRole.Administrator);
+            if (!isAdmin)
+            {
+                _txtStatus.Text = "Berjalan tanpa hak Admin - pembersihan tidak akan menyeluruh.";
+            }
+
+            UpdateDisplay();
+
+            _timer = new DispatcherTimer();
+            _timer.Interval = TimeSpan.FromSeconds(2);
+            _timer.Tick += delegate { UpdateDisplay(); CheckAutoClean(); };
+            _timer.Start();
+
+            app.Run(_window);
+        }
+
+        private static Border MakeCard(Thickness margin)
+        {
+            Border b = new Border();
+            b.Background = Solid(ColPanel);
+            b.CornerRadius = new CornerRadius(10);
+            b.Padding = new Thickness(16);
+            b.Margin = margin;
+            return b;
+        }
+
+        private static void CardLabel(StackPanel sp, string text, Color color)
+        {
+            TextBlock t = new TextBlock();
+            t.Text = text;
+            t.FontSize = 12;
+            t.FontWeight = FontWeights.Bold;
+            t.Foreground = Solid(color);
+            sp.Children.Add(t);
+        }
+
+        private static Window BuildWindow()
+        {
+            Window w = new Window();
+            w.Title = "RAM Cleaner";
+            w.Width = 1120;
+            w.Height = 620;
+            w.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            w.ResizeMode = ResizeMode.CanMinimize;
+            w.Background = Solid(ColBg);
+            w.FontFamily = new FontFamily("Segoe UI");
+
+            Grid root = new Grid();
+            root.Margin = new Thickness(18);
+            RowDefinition rr0 = new RowDefinition();
+            rr0.Height = GridLength.Auto;
+            RowDefinition rr1 = new RowDefinition();
+            rr1.Height = GridLength.Auto;
+            RowDefinition rr2 = new RowDefinition();
+            rr2.Height = new GridLength(1, GridUnitType.Star);
+            root.RowDefinitions.Add(rr0);
+            root.RowDefinitions.Add(rr1);
+            root.RowDefinitions.Add(rr2);
+            w.Content = root;
+
+            TextBlock title = new TextBlock();
+            title.Text = "RAM CLEANER";
+            title.FontSize = 14;
+            title.FontWeight = FontWeights.Bold;
+            title.Foreground = Solid(ColBlue);
+            title.SetValue(Grid.RowProperty, 0);
+            root.Children.Add(title);
+
+            TextBlock subtitle = new TextBlock();
+            subtitle.Text = "Pembersih memori - mode cepat & mendalam";
+            subtitle.FontSize = 11;
+            subtitle.Foreground = Solid(ColSubtext);
+            subtitle.Margin = new Thickness(0, 2, 0, 12);
+            subtitle.SetValue(Grid.RowProperty, 1);
+            root.Children.Add(subtitle);
+
+            // ===== KONTEN HORIZONTAL: 3 KOLOM =====
+            Grid content = new Grid();
+            ColumnDefinition cc0 = new ColumnDefinition();
+            cc0.Width = new GridLength(0.95, GridUnitType.Star);
+            ColumnDefinition cc1 = new ColumnDefinition();
+            cc1.Width = new GridLength(1.05, GridUnitType.Star);
+            ColumnDefinition cc2 = new ColumnDefinition();
+            cc2.Width = new GridLength(1.55, GridUnitType.Star);
+            content.ColumnDefinitions.Add(cc0);
+            content.ColumnDefinitions.Add(cc1);
+            content.ColumnDefinitions.Add(cc2);
+            content.SetValue(Grid.RowProperty, 2);
+            root.Children.Add(content);
+
+            // --- Kolom 1: Penggunaan RAM ---
+            Border usageCard = MakeCard(new Thickness(0, 0, 10, 0));
+            StackPanel usp = new StackPanel();
+            usageCard.Child = usp;
+            Grid.SetColumn(usageCard, 0);
+            content.Children.Add(usageCard);
+
+            CardLabel(usp, "PENGGUNAAN RAM", ColBlue);
+
+            _txtUsage = new TextBlock();
+            _txtUsage.Text = "-";
+            _txtUsage.FontSize = 58;
+            _txtUsage.FontWeight = FontWeights.Bold;
+            _txtUsage.Foreground = Solid(ColGreen);
+            _txtUsage.HorizontalAlignment = HorizontalAlignment.Center;
+            _txtUsage.Margin = new Thickness(0, 10, 0, 0);
+            usp.Children.Add(_txtUsage);
+
+            Grid meter = new Grid();
+            meter.Height = 14;
+            meter.Margin = new Thickness(0, 12, 0, 0);
+
+            Border track = new Border();
+            track.CornerRadius = new CornerRadius(7);
+            track.Background = Solid(ColSurface);
+            meter.Children.Add(track);
+
+            _barFill = new Border();
+            _barFill.CornerRadius = new CornerRadius(7);
+            _barFill.HorizontalAlignment = HorizontalAlignment.Left;
+            _barFill.Margin = new Thickness(1);
+            _barFill.Background = Solid(ColGreen);
+            meter.Children.Add(_barFill);
+
+            _meter = meter;
+            meter.SizeChanged += delegate { RefreshFillWidth(); };
+            usp.Children.Add(meter);
+
+            _txtDetail = new TextBlock();
+            _txtDetail.FontSize = 12;
+            _txtDetail.Foreground = Solid(ColSubtext);
+            _txtDetail.HorizontalAlignment = HorizontalAlignment.Center;
+            _txtDetail.TextAlignment = TextAlignment.Center;
+            _txtDetail.TextWrapping = TextWrapping.Wrap;
+            _txtDetail.Margin = new Thickness(0, 12, 0, 0);
+            usp.Children.Add(_txtDetail);
+
+            Grid stack = new Grid();
+            stack.Height = 10;
+            stack.Margin = new Thickness(0, 14, 0, 0);
+
+            Border stackTrack = new Border();
+            stackTrack.CornerRadius = new CornerRadius(5);
+            stackTrack.Background = Solid(ColSurface);
+            stack.Children.Add(stackTrack);
+
+            ColumnDefinition cd1 = new ColumnDefinition();
+            cd1.Width = new GridLength(0, GridUnitType.Star);
+            ColumnDefinition cd2 = new ColumnDefinition();
+            cd2.Width = new GridLength(0, GridUnitType.Star);
+            ColumnDefinition cd3 = new ColumnDefinition();
+            cd3.Width = new GridLength(1, GridUnitType.Star);
+            stack.ColumnDefinitions.Add(cd1);
+            stack.ColumnDefinitions.Add(cd2);
+            stack.ColumnDefinitions.Add(cd3);
+
+            Border barInUse = new Border();
+            barInUse.CornerRadius = new CornerRadius(5, 0, 0, 5);
+            barInUse.Margin = new Thickness(1, 1, 0, 1);
+            barInUse.Background = Solid(ColGreen);
+            Grid.SetColumn(barInUse, 0);
+            stack.Children.Add(barInUse);
+
+            Border barStandby = new Border();
+            barStandby.Margin = new Thickness(0, 1, 0, 1);
+            barStandby.Background = Solid(ColBlue);
+            Grid.SetColumn(barStandby, 1);
+            stack.Children.Add(barStandby);
+
+            Border barFree = new Border();
+            barFree.CornerRadius = new CornerRadius(0, 5, 5, 0);
+            barFree.Margin = new Thickness(0, 1, 1, 1);
+            barFree.Background = Solid(ColSubtext);
+            Grid.SetColumn(barFree, 2);
+            stack.Children.Add(barFree);
+
+            _barInUse = barInUse;
+            _barStandby = barStandby;
+            _barFree = barFree;
+            _stack = stack;
+            stack.SizeChanged += delegate { RefreshStackWidths(); };
+            usp.Children.Add(stack);
+
+            TextBlock breakdown = new TextBlock();
+            breakdown.FontSize = 11;
+            breakdown.HorizontalAlignment = HorizontalAlignment.Center;
+            breakdown.TextAlignment = TextAlignment.Center;
+            breakdown.TextWrapping = TextWrapping.Wrap;
+            breakdown.Margin = new Thickness(0, 8, 0, 0);
+            usp.Children.Add(breakdown);
+            _txtBreakdown = breakdown;
+
+            // --- Kolom 2: Kontrol ---
+            Border ctrlCard = MakeCard(new Thickness(0, 0, 10, 0));
+            StackPanel csp = new StackPanel();
+            ctrlCard.Child = csp;
+            Grid.SetColumn(ctrlCard, 1);
+            content.Children.Add(ctrlCard);
+
+            CardLabel(csp, "KONTROL", ColTeal);
+
+            Button clean = new Button();
+            clean.Content = "Bersihkan RAM";
+            clean.Height = 46;
+            clean.FontSize = 15;
+            clean.FontWeight = FontWeights.Bold;
+            clean.Margin = new Thickness(0, 12, 0, 0);
+            clean.Style = ButtonStyle(Solid(ColBlue), Solid(ColBlueHi), Solid(ColBg));
+            csp.Children.Add(clean);
+            _btnClean = clean;
+
+            Button refresh = new Button();
+            refresh.Content = "Refresh";
+            refresh.Height = 34;
+            refresh.Margin = new Thickness(0, 8, 0, 0);
+            refresh.FontSize = 12;
+            refresh.Style = ButtonStyle(Solid(ColSurface), Solid(ColSurfaceHi), Solid(ColText));
+            refresh.Click += delegate { UpdateDisplay(); };
+            csp.Children.Add(refresh);
+
+            Button restartExplorer = new Button();
+            restartExplorer.Content = "Restart Explorer";
+            restartExplorer.Height = 40;
+            restartExplorer.Margin = new Thickness(0, 14, 0, 0);
+            restartExplorer.FontSize = 13;
+            restartExplorer.FontWeight = FontWeights.Bold;
+            restartExplorer.Style = ButtonStyle(Solid(ColYellow), Solid(ColSurfaceHi), Solid(ColBg));
+            csp.Children.Add(restartExplorer);
+            _btnRestartExplorer = restartExplorer;
+
+            CheckBox aggressive = new CheckBox();
+            aggressive.Content = "Mode mendalam: proses sistem non-kritis + file cache (putaran adaptif)";
+            aggressive.FontSize = 11;
+            aggressive.Foreground = Solid(ColSubtext);
+            aggressive.IsChecked = true;
+            aggressive.Margin = new Thickness(2, 14, 0, 0);
+            csp.Children.Add(aggressive);
+            _chkAggressive = aggressive;
+
+            StackPanel autoRow = new StackPanel();
+            autoRow.Orientation = Orientation.Horizontal;
+            autoRow.Margin = new Thickness(2, 8, 0, 0);
+
+            CheckBox auto = new CheckBox();
+            auto.Content = "Auto bersihkan bila RAM di atas ";
+            auto.FontSize = 11;
+            auto.Foreground = Solid(ColSubtext);
+            auto.VerticalAlignment = VerticalAlignment.Center;
+            autoRow.Children.Add(auto);
+
+            TextBox thresh = new TextBox();
+            thresh.Text = "85";
+            thresh.Width = 34;
+            thresh.FontSize = 11;
+            thresh.Margin = new Thickness(4, 0, 2, 0);
+            thresh.Padding = new Thickness(2, 1, 2, 1);
+            thresh.VerticalAlignment = VerticalAlignment.Center;
+            thresh.Background = Solid(ColSurface);
+            thresh.Foreground = Solid(ColText);
+            thresh.BorderBrush = Solid(ColSurfaceHi);
+            thresh.BorderThickness = new Thickness(1);
+            autoRow.Children.Add(thresh);
+
+            TextBlock pctSuffix = new TextBlock();
+            pctSuffix.Text = "%";
+            pctSuffix.FontSize = 11;
+            pctSuffix.Foreground = Solid(ColSubtext);
+            pctSuffix.VerticalAlignment = VerticalAlignment.Center;
+            autoRow.Children.Add(pctSuffix);
+
+            csp.Children.Add(autoRow);
+            _chkAuto = auto;
+            _txtThreshold = thresh;
+
+            Button btnLog = new Button();
+            btnLog.Content = "Buka Log Pembersihan";
+            btnLog.Height = 30;
+            btnLog.Margin = new Thickness(2, 10, 0, 0);
+            btnLog.FontSize = 11;
+            btnLog.Style = ButtonStyle(Solid(ColSurface), Solid(ColSurfaceHi), Solid(ColText));
+            btnLog.Click += delegate { OpenLog(); };
+            csp.Children.Add(btnLog);
+
+            _txtStatus = new TextBlock();
+            _txtStatus.FontSize = 12;
+            _txtStatus.Foreground = Solid(ColTeal);
+            _txtStatus.TextWrapping = TextWrapping.Wrap;
+            _txtStatus.Margin = new Thickness(0, 14, 0, 0);
+            csp.Children.Add(_txtStatus);
+
+            // --- Kolom 3: Daftar proses ---
+            Border procCard = MakeCard(new Thickness(0));
+            Grid pg = new Grid();
+            RowDefinition pr0 = new RowDefinition();
+            pr0.Height = GridLength.Auto;
+            RowDefinition pr1 = new RowDefinition();
+            pr1.Height = new GridLength(1, GridUnitType.Star);
+            pg.RowDefinitions.Add(pr0);
+            pg.RowDefinitions.Add(pr1);
+            procCard.Child = pg;
+            Grid.SetColumn(procCard, 2);
+            content.Children.Add(procCard);
+
+            TextBlock listLabel = new TextBlock();
+            listLabel.Text = "PROSES TERATAS BERDASARKAN PENGGUNAAN RAM (klik kanan untuk bersihkan)";
+            listLabel.FontSize = 12;
+            listLabel.FontWeight = FontWeights.Bold;
+            listLabel.Foreground = Solid(ColSubtext);
+            listLabel.SetValue(Grid.RowProperty, 0);
+            pg.Children.Add(listLabel);
+
+            ListView lv = new ListView();
+            lv.Margin = new Thickness(0, 8, 0, 0);
+            lv.Background = Solid(ColBg);
+            lv.BorderBrush = Solid(ColSurface);
+            lv.BorderThickness = new Thickness(1);
+            lv.SetValue(Grid.RowProperty, 1);
+
+            GridView gv = new GridView();
+
+            GridViewColumn c1 = new GridViewColumn();
+            c1.Header = "Nama Proses";
+            c1.DisplayMemberBinding = new Binding("Name");
+            c1.Width = 280;
+            gv.Columns.Add(c1);
+
+            GridViewColumn c2 = new GridViewColumn();
+            c2.Header = "PID";
+            c2.DisplayMemberBinding = new Binding("Id");
+            c2.Width = 70;
+            gv.Columns.Add(c2);
+
+            GridViewColumn c3 = new GridViewColumn();
+            c3.Header = "RAM (MB)";
+            c3.DisplayMemberBinding = new Binding("MemMB");
+            c3.Width = 110;
+            gv.Columns.Add(c3);
+
+            lv.View = gv;
+
+            Style headerStyle = new Style(typeof(GridViewColumnHeader));
+            headerStyle.Setters.Add(new Setter(GridViewColumnHeader.BackgroundProperty, Solid(ColSurface)));
+            headerStyle.Setters.Add(new Setter(GridViewColumnHeader.ForegroundProperty, Solid(ColText)));
+            headerStyle.Setters.Add(new Setter(GridViewColumnHeader.BorderThicknessProperty, new Thickness(0)));
+            headerStyle.Setters.Add(new Setter(GridViewColumnHeader.PaddingProperty, new Thickness(6, 6, 6, 6)));
+            lv.Resources.Add(typeof(GridViewColumnHeader), headerStyle);
+
+            Style itemStyle = new Style(typeof(ListViewItem));
+            itemStyle.Setters.Add(new Setter(ListViewItem.ForegroundProperty, Solid(ColText)));
+            itemStyle.Setters.Add(new Setter(ListViewItem.PaddingProperty, new Thickness(4, 2, 4, 2)));
+            lv.ItemContainerStyle = itemStyle;
+
+            ContextMenu cm = new ContextMenu();
+            MenuItem miClean = new MenuItem();
+            miClean.Header = "Bersihkan proses ini";
+            miClean.Click += delegate { CleanSingle(cm.Tag as ProcItem); };
+            cm.Items.Add(miClean);
+            MenuItem miKill = new MenuItem();
+            miKill.Header = "Akhiri proses ini";
+            miKill.Click += delegate { KillSingle(cm.Tag as ProcItem); };
+            cm.Items.Add(miKill);
+            cm.Opened += delegate
+            {
+                ProcItem sel = _lvProcs.SelectedItem as ProcItem;
+                cm.Tag = sel;
+                miClean.IsEnabled = sel != null;
+                miKill.IsEnabled = sel != null;
+                miClean.Header = sel != null
+                    ? "Bersihkan '" + sel.Name + "'"
+                    : "Bersihkan proses ini";
+                miKill.Header = sel != null
+                    ? "Akhiri '" + sel.Name + "'"
+                    : "Akhiri proses ini";
+            };
+            lv.ContextMenu = cm;
+
+            lv.PreviewMouseRightButtonDown += delegate(object sender, MouseButtonEventArgs args)
+            {
+                DependencyObject src = args.OriginalSource as DependencyObject;
+                if (src == null) { return; }
+                ListViewItem container =
+                    ItemsControl.ContainerFromElement(lv, src) as ListViewItem;
+                if (container != null)
+                {
+                    container.IsSelected = true;
+                }
+            };
+
+            _lvProcs = lv;
+            pg.Children.Add(lv);
+
+            return w;
+        }
+
+        private static void WireEvents()
+        {
+            _btnClean.Click += delegate { CleanRam(false); };
+            _btnRestartExplorer.Click += delegate { RestartExplorer(); };
+        }
+
+        private static void RestartExplorer()
+        {
+            if (_isCleaning) { return; }
+
+            MessageBoxResult r = MessageBox.Show(
+                "Restart Windows Explorer?\n\n" +
+                "Taskbar & desktop hilang sebentar (2-5 detik).\n" +
+                "Jendela File Explorer yang terbuka akan tertutup.\n" +
+                "Aplikasi lain TIDAK terpengaruh.",
+                "Restart Explorer",
+                MessageBoxButton.OKCancel, MessageBoxImage.Question);
+            if (r != MessageBoxResult.OK) { return; }
+
+            _isCleaning = true;
+            _btnClean.IsEnabled = false;
+            try
+            {
+                SetStatus("Mematikan explorer.exe...");
+
+                foreach (Process p in Process.GetProcessesByName("explorer"))
+                {
+                    try { p.Kill(); } catch { }
+                    finally
+                    {
+                        try { p.Dispose(); } catch { }
+                    }
+                }
+
+                System.Threading.Thread.Sleep(1500);
+
+                // Windows biasanya me-restart otomatis (AutoRestartShell).
+                // Kalau belum, jalankan manual.
+                if (Process.GetProcessesByName("explorer").Length == 0)
+                {
+                    SetStatus("Menjalankan ulang explorer.exe...");
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = System.Environment.SystemDirectory + "\\explorer.exe",
+                        UseShellExecute = true
+                    });
+                    System.Threading.Thread.Sleep(1000);
+                }
+
+                int count = Process.GetProcessesByName("explorer").Length;
+                if (count > 0)
+                {
+                    _txtStatus.Text = "Explorer berhasil direstart. " +
+                        "Memori shell kembali ke ukuran awal.";
+                    UpdateDisplay();
+                }
+                else
+                {
+                    _txtStatus.Text = "Gagal menjalankan ulang otomatis. " +
+                        "Buka manual: Ctrl+Shift+Esc > Run new task > explorer.exe";
+                }
+            }
+            catch (Exception ex)
+            {
+                _txtStatus.Text = "Terjadi kesalahan: " + ex.Message;
+            }
+            finally
+            {
+                _btnClean.IsEnabled = true;
+                _isCleaning = false;
+            }
+        }
+
+        private static Style ButtonStyle(Brush normal, Brush hover, Brush foreground)
+        {
+            Style st = new Style(typeof(Button));
+            st.Setters.Add(new Setter(Button.BackgroundProperty, normal));
+            st.Setters.Add(new Setter(Button.ForegroundProperty, foreground));
+            st.Setters.Add(new Setter(Button.BorderThicknessProperty, new Thickness(0)));
+            st.Setters.Add(new Setter(Button.CursorProperty, Cursors.Hand));
+
+            Trigger t = new Trigger();
+            t.Property = UIElement.IsMouseOverProperty;
+            t.Value = true;
+            t.Setters.Add(new Setter(Button.BackgroundProperty, hover));
+            st.Triggers.Add(t);
+
+            Trigger pressed = new Trigger();
+            pressed.Property = Button.IsPressedProperty;
+            pressed.Value = true;
+            pressed.Setters.Add(new Setter(Button.BackgroundProperty, hover));
+            st.Triggers.Add(pressed);
+
+            return st;
+        }
+
+        private static Brush Solid(Color c)
+        {
+            SolidColorBrush b = new SolidColorBrush(c);
+            b.Freeze();
+            return b;
+        }
+
+        private static void RefreshFillWidth()
+        {
+            double avail = _meter.ActualWidth - 2.0;
+            if (avail <= 0)
+            {
+                return;
+            }
+            double frac = Math.Max(0, Math.Min(100, _lastPct)) / 100.0;
+            _barFill.Width = frac * avail;
+        }
+
+        private static void RefreshStackWidths()
+        {
+            double total = _lastInUseFrac + _lastStandbyFrac;
+            double free = 1.0 - total;
+            if (total <= 0) { free = 1.0; }
+            _stack.ColumnDefinitions[0].Width =
+                new GridLength(Math.Max(0, _lastInUseFrac), GridUnitType.Star);
+            _stack.ColumnDefinitions[1].Width =
+                new GridLength(Math.Max(0, _lastStandbyFrac), GridUnitType.Star);
+            _stack.ColumnDefinitions[2].Width =
+                new GridLength(Math.Max(0, free), GridUnitType.Star);
+        }
+
+        private static string FmtGb(ulong bytes)
+        {
+            return string.Format("{0:N2} GB", bytes / 1073741824.0);
+        }
+
+        private static void UpdateDisplay()
+        {
+            try
+            {
+                MemApi.MEMORYSTATUSEX s = MemApi.GetStatus();
+                ulong used = s.ullTotalPhys - s.ullAvailPhys;
+                int pct = (int)s.dwMemoryLoad;
+                _lastPct = pct;
+
+                Brush meterBrush;
+                if (pct < 60) { meterBrush = Solid(ColGreen); }
+                else if (pct < 85) { meterBrush = Solid(ColYellow); }
+                else { meterBrush = Solid(ColRed); }
+
+                _txtUsage.Text = pct + "%";
+                _txtUsage.Foreground = meterBrush;
+                _barFill.Background = meterBrush;
+                RefreshFillWidth();
+
+                _txtDetail.Text = string.Format(
+                    "Terpakai {0}   |   Total {1}   |   Bebas {2}",
+                    FmtGb(used), FmtGb(s.ullTotalPhys), FmtGb(s.ullAvailPhys));
+
+                _lvProcs.ItemsSource = GetTopProcesses();
+            }
+            catch { }
+        }
+
+        private static List<ProcItem> GetTopProcesses()
+        {
+            List<ProcItem> list = new List<ProcItem>();
+            Process[] procs = Process.GetProcesses();
+            foreach (Process p in procs)
+            {
+                try
+                {
+                    long ws = p.WorkingSet64;
+                    if (ws > 10485760L)
+                    {
+                        ProcItem it = new ProcItem();
+                        it.Name = p.ProcessName;
+                        it.Id = p.Id;
+                        it.MemMB = Math.Round(ws / 1048576.0, 1);
+                        list.Add(it);
+                    }
+                }
+                catch { }
+                finally
+                {
+                    try { p.Dispose(); } catch { }
+                }
+            }
+
+            list.Sort(delegate(ProcItem a, ProcItem b) { return b.MemMB.CompareTo(a.MemMB); });
+            if (list.Count > 25)
+            {
+                list.RemoveRange(25, list.Count - 25);
+            }
+            return list;
+        }
+
+        private static void SetStatus(string text)
+        {
+            _txtStatus.Text = text;
+            PumpBackground();
+        }
+
+        private static void PumpBackground()
+        {
+            _window.Dispatcher.Invoke(new Action(delegate { }), DispatcherPriority.Background);
+        }
+
+        private static string RunMemCommand(int command)
+        {
+            try
+            {
+                int cmd = command;
+                int st = MemApi.NtSetSystemInformation(
+                    MemApi.SystemMemoryListInformation, ref cmd, 4);
+                if (st == 0)
+                {
+                    return null;
+                }
+                return "NTSTATUS 0x" + st.ToString("X");
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
+            }
+        }
+
+        private static string TrimSystemFileCache()
+        {
+            try
+            {
+                IntPtr min, max;
+                uint flags;
+                if (!MemApi.GetSystemFileCacheSize(out min, out max, out flags))
+                {
+                    return "Gagal membaca batas file cache";
+                }
+
+                // Coba lepas seluruh file cache dengan menurunkan batas ke nol
+                bool ok1 = MemApi.SetSystemFileCacheSize(min, IntPtr.Zero, flags);
+                System.Threading.Thread.Sleep(250);
+                bool ok2 = RestoreFileCacheLimit(min, max, flags);
+
+                if (!ok1)
+                {
+                    // Fallback: turunkan batas 256 MB dari nilai semula
+                    long maxCur = max.ToInt64();
+                    long target = maxCur < 0 ? 0 : Math.Max(maxCur - 268435456L, 0);
+                    ok1 = MemApi.SetSystemFileCacheSize(min, (IntPtr)target, flags);
+                    System.Threading.Thread.Sleep(250);
+                    ok2 = RestoreFileCacheLimit(min, max, flags);
+                }
+
+                if (!ok1 || !ok2)
+                {
+                    return "Gagal memulihkan batas file cache";
+                }
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
+            }
+        }
+
+        private static bool RestoreFileCacheLimit(IntPtr min, IntPtr max, uint flags)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                if (MemApi.SetSystemFileCacheSize(min, max, flags))
+                {
+                    return true;
+                }
+                System.Threading.Thread.Sleep(150);
+            }
+            return false;
+        }
+
+        private static void ScheduleSettleRefresh()
+        {
+            DispatcherTimer settle = new DispatcherTimer();
+            settle.Interval = TimeSpan.FromSeconds(2);
+            settle.Tick += delegate
+            {
+                UpdateDisplay();
+                settle.Stop();
+            };
+            settle.Start();
+        }
+
+        private static void CleanRam(bool fromAuto)
+        {
+            if (_isCleaning) { return; }
+            _isCleaning = true;
+            _btnClean.IsEnabled = false;
+            try
+            {
+                bool deep = _chkAggressive.IsChecked == true;
+                int ownId = Process.GetCurrentProcess().Id;
+
+                SetStatus("Menyiapkan hak istimewa sistem...");
+                bool privOk = Privilege.Enable("SeProfileSingleProcessPrivilege")
+                    && Privilege.Enable("SeIncreaseQuotaPrivilege");
+
+                MemApi.MEMORYSTATUSEX before = MemApi.GetStatus();
+                int pctBefore = (int)before.dwMemoryLoad;
+
+                string[] excl = deep ? ExcludedCritical : Excluded;
+                int maxRounds = deep ? 6 : 2;
+                int roundsDone = 0;
+                int cleaned = 0;
+                string err2 = null;
+                string err3 = null;
+                string err4 = null;
+                double prevAvailMb = -1;
+
+                for (int r = 1; r <= maxRounds; r++)
+                {
+                    if (deep)
+                    {
+                        SetStatus(string.Format(
+                            "Putaran {0}/{1}: membersihkan working set semua proses...", r, maxRounds));
+                    }
+                    else
+                    {
+                        SetStatus(string.Format("Membersihkan ({0}/{1})...", r, maxRounds));
+                    }
+
+                    cleaned += SweepProcesses(excl, ownId);
+                    System.Threading.Thread.Sleep(deep ? 300 : 80);
+
+                    // Purge standby list di setiap putaran
+                    err2 = RunMemCommand(MemApi.CmdPurgeLowPriorityStandbyList);
+                    System.Threading.Thread.Sleep(120);
+                    err3 = RunMemCommand(MemApi.CmdPurgeStandbyList);
+                    System.Threading.Thread.Sleep(deep ? 350 : 200);
+
+                    roundsDone++;
+
+                    // Berhenti lebih awal bila hasil sudah konvergen
+                    MemApi.MEMORYSTATUSEX probe = MemApi.GetStatus();
+                    double availMb = probe.ullAvailPhys / 1048576.0;
+                    if (prevAvailMb >= 0)
+                    {
+                        double gain = availMb - prevAvailMb;
+                        int minRounds = deep ? 2 : 1;
+                        if (r >= minRounds && gain < 30)
+                        {
+                            break;
+                        }
+                    }
+                    prevAvailMb = availMb;
+                }
+
+                if (deep)
+                {
+                    SetStatus("Tahap dalam: mengosongkan file cache sistem...");
+                    err4 = TrimSystemFileCache();
+
+                    SetStatus("Tahap dalam: siklus pembersihan terakhir...");
+                    cleaned += SweepProcesses(ExcludedCritical, ownId);
+                    RunMemCommand(MemApi.CmdPurgeLowPriorityStandbyList);
+                    RunMemCommand(MemApi.CmdPurgeStandbyList);
+                    System.Threading.Thread.Sleep(400);
+                }
+                else
+                {
+                    System.Threading.Thread.Sleep(300);
+                }
+
+                // Bersihkan working set aplikasi ini sendiri sebagai penutup
+                try { MemApi.EmptyWorkingSet(Process.GetCurrentProcess().Handle); } catch { }
+
+                System.Threading.Thread.Sleep(500);
+                MemApi.MEMORYSTATUSEX after = MemApi.GetStatus();
+                int pctAfter = (int)after.dwMemoryLoad;
+
+                long usedBefore = (long)(before.ullTotalPhys - before.ullAvailPhys);
+                long usedAfter = (long)(after.ullTotalPhys - after.ullAvailPhys);
+                double freedMb = (usedBefore - usedAfter) / 1048576.0;
+                if (freedMb < 0) { freedMb = 0; }
+
+                UpdateDisplay();
+
+                string modeText = deep
+                    ? "Mode mendalam (" + roundsDone + " putaran adaptif + file cache)."
+                    : "Mode cepat (" + roundsDone + " putaran).";
+                string msg = string.Format(
+                    "Selesai! {0} proses dibersihkan. {1}\n" +
+                    "RAM terpakai berkurang sekitar {2:N0} MB ({3}% menjadi {4}%).",
+                    cleaned, modeText, freedMb, pctBefore, pctAfter);
+
+                int failedStages = 0;
+                if (!privOk) { failedStages++; }
+                if (err2 != null) { failedStages++; }
+                if (err3 != null) { failedStages++; }
+                if (deep && err4 != null) { failedStages++; }
+
+                if (failedStages > 0)
+                {
+                    msg += "\nCatatan: " + failedStages +
+                        " tahap sistem tidak berhasil dijalankan. Jalankan sebagai Administrator.";
+                }
+
+                if (fromAuto) { msg = "[AUTO] " + msg; }
+
+                _txtStatus.Text = msg;
+                ScheduleSettleRefresh();
+            }
+            catch (Exception ex)
+            {
+                _txtStatus.Text = "Terjadi kesalahan: " + ex.Message;
+            }
+            finally
+            {
+                _btnClean.IsEnabled = true;
+                _isCleaning = false;
+                _lastCleanTime = DateTime.Now;
+            }
+        }
+
+        private static int SweepProcesses(string[] excluded, int ownId)
+        {
+            int n = 0;
+            Process[] procs = Process.GetProcesses();
+            foreach (Process p in procs)
+            {
+                try
+                {
+                    if (p.Id == ownId) { continue; }
+                    if (Array.IndexOf(excluded, p.ProcessName.ToLower()) >= 0) { continue; }
+                    IntPtr h = p.Handle;
+                    if (h != IntPtr.Zero && MemApi.EmptyWorkingSet(h))
+                    {
+                        n++;
+                    }
+                }
+                catch { }
+                finally
+                {
+                    try { p.Dispose(); } catch { }
+                }
+            }
+            return n;
+        }
+
+        private static void CheckAutoClean()
+        {
+            if (_isCleaning || _chkAuto.IsChecked != true) { return; }
+            int t;
+            if (!int.TryParse(_txtThreshold.Text.Trim(), out t)) { return; }
+            if (t < 50 || t > 99) { return; }
+            if (_lastPct < t) { return; }
+            if ((DateTime.Now - _lastCleanTime).TotalSeconds < 60) { return; }
+            CleanRam(true);
+        }
+
+        private static void CleanSingle(ProcItem it)
+        {
+            if (it == null) { return; }
+            try
+            {
+                Process p = Process.GetProcessById(it.Id);
+                long beforeWs = 0;
+                bool ok = false;
+                try
+                {
+                    beforeWs = p.WorkingSet64;
+                    ok = MemApi.EmptyWorkingSet(p.Handle);
+                }
+                finally
+                {
+                    try { p.Dispose(); } catch { }
+                }
+
+                System.Threading.Thread.Sleep(200);
+
+                double freed = 0;
+                try
+                {
+                    Process p2 = Process.GetProcessById(it.Id);
+                    freed = Math.Max(0, (beforeWs - p2.WorkingSet64) / 1048576.0);
+                    p2.Dispose();
+                }
+                catch { }
+
+                UpdateDisplay();
+                _txtStatus.Text = ok
+                    ? string.Format("Proses '{0}' dibersihkan (sekitar {1:N0} MB dilepas).", it.Name, freed)
+                    : "Gagal membersihkan proses tersebut.";
+            }
+            catch
+            {
+                _txtStatus.Text = "Proses sudah tidak berjalan.";
+            }
+        }
+    }
+}
